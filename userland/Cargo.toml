@@ -1,0 +1,17 @@
+[package]
+name = "userland"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "libfipsos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "npu_infer"
+path = "src/main.rs"
+
+[dependencies]
+ostd = { path = "../ostd" }

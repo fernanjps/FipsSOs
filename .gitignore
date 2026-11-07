@@ -1,0 +1,15 @@
+# Carpetas de compilación de Rust y C/C++
+target/
+build/
+
+# Archivos de arranque temporales y discos virtuales
+*.iso
+*.bin
+*.elf
+*.tar
+*.img
+
+# Archivos temporales de edición
+.vscode/
+*.swp
+*~

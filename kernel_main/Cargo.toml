@@ -1,0 +1,15 @@
+[package]
+name = "kernel_main"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fipsos-kernel"
+path = "src/main.rs"
+
+[dependencies]
+ostd.workspace = true
+kernel_objects.workspace = true
+linux_abi.workspace = true

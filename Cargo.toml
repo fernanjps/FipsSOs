@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "ostd",
+    "kernel_objects",
+    "linux_abi",
+    "kernel_main",
+    "userland",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["FipSOs Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bitflags = "2.13"
+limine = "0.5"
+ostd = { path = "ostd" }
+kernel_objects = { path = "kernel_objects" }
+linux_abi = { path = "linux_abi" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 2

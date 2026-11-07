@@ -1,0 +1,47 @@
+OUTPUT_FORMAT(elf64-x86-64)
+OUTPUT_ARCH(i386:x86-64)
+ENTRY(_user_start)
+
+PHDRS
+{
+    text    PT_LOAD FLAGS(5); /* PF_R | PF_X (1 | 4) - Strict W^X Code */
+    rodata  PT_LOAD FLAGS(4); /* PF_R        (4)     - Strict W^X Read-Only Data */
+    data    PT_LOAD FLAGS(6); /* PF_R | PF_W (2 | 4) - Strict W^X Read-Write Data */
+}
+
+PROVIDE(__fipsos_kernel_main_entry = 0);
+
+SECTIONS
+{
+    /* Base User-Space Virtual Address for /bin/npu_infer.elf (distinct from Shell @ 0x00400000) */
+    . = 0x0000000000500000;
+
+    .text ALIGN(0x1000) : {
+        KEEP(*(.text._user_start))
+        *(.text .text.*)
+    } :text
+
+    .rodata ALIGN(0x1000) : {
+        __fipsos_user_main_entry = .;
+        KEEP(*(.rodata.*__FIPSOS_USER_MAIN_ENTRY*))
+        ASSERT(. - __fipsos_user_main_entry == 8, "Falta registrar el punto de entrada con ostd::user_main!");
+        *(.rodata .rodata.*)
+        *(.got .got.*)
+    } :rodata
+
+    .data ALIGN(0x1000) : {
+        *(.data .data.*)
+    } :data
+
+    .bss ALIGN(0x1000) : {
+        *(COMMON)
+        *(.bss .bss.*)
+    } :data
+
+    /DISCARD/ : {
+        *(.limine_requests*)
+        *(.eh_frame*)
+        *(.note .note.*)
+        *(.comment)
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "linux_abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ostd.workspace = true
+kernel_objects.workspace = true
