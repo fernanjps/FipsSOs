@@ -11,8 +11,8 @@ PHDRS
 
 SECTIONS
 {
-    /* Base User-Space Virtual Address for /bin/avatar_cpp.elf (C++20 @ 0x00600000) */
-    . = 0x0000000000600000;
+    /* Unified Canonical Linux x86_64 User Base (0x00400000) isolated by dedicated Process CR3/PML4 */
+    . = 0x0000000000400000;
 
     .text ALIGN(0x1000) : {
         KEEP(*(.text._start))

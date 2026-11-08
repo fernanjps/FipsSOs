@@ -1,6 +1,8 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::arch::fpu::FpuState;
 use crate::mm::{
     vm_space::{
         map_user_segment, read_user_bytes as vm_read_user_bytes,
@@ -12,11 +14,12 @@ use crate::sync::SpinLock;
 
 pub use crate::mm::vm_space::{map_vmo_to_user, protect_user_segment};
 
-/// x86_64 Architectural MSRs for `syscall` / `sysretq` and `swapgs`.
+/// x86_64 Architectural MSRs for `syscall` / `sysretq`, `swapgs`, and Thread-Local Storage (TLS).
 pub const MSR_IA32_EFER: u32 = 0xC000_0080;
 pub const MSR_IA32_STAR: u32 = 0xC000_0081;
 pub const MSR_IA32_LSTAR: u32 = 0xC000_0082;
 pub const MSR_IA32_FMASK: u32 = 0xC000_0084;
+pub const MSR_IA32_FS_BASE: u32 = 0xC000_0100;
 pub const MSR_IA32_GS_BASE: u32 = 0xC000_0101;
 pub const MSR_IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -27,13 +30,13 @@ const SYSCALL_RFLAGS_MASK: u64 = 0x0004_0300; // Clear IF (bit 9), TF (bit 8), A
 /// Canonical Lower-Half User Space virtual addresses used for Ring 3 execution.
 pub const USER_CODE_BASE_VADDR: u64 = USER_SPACE_LOW_BASE;
 pub const USER_STACK_BASE_VADDR: u64 = USER_STACK_DEFAULT_BASE;
-pub const USER_STACK_PAGES: usize = 4; // 16 KiB Ring 3 stack (Parent Shell)
+pub const USER_STACK_PAGES: usize = 4; // 16 KiB Ring 3 stack (0x0080_0000..0x0080_4000)
 
-/// Dedicated Lower-Half User Stack base for child ELF64 processes launched via `sys_execve` (`0x0090_0000`).
-pub const USER_CHILD_STACK_BASE_VADDR: u64 = 0x0000_0000_0090_0000;
+/// Unified Lower-Half User Stack base for isolated child ELF64 `CR3` processes (`0x0080_0000`).
+pub const USER_CHILD_STACK_BASE_VADDR: u64 = USER_STACK_DEFAULT_BASE;
 pub const USER_CHILD_STACK_PAGES: usize = 4; // 16 KiB Ring 3 stack (Child Process)
 
-const SYSCALL_KERNEL_STACK_SIZE: usize = 16 * 1024;
+const SYSCALL_KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 struct SyscallStack([u8; SYSCALL_KERNEL_STACK_SIZE]);
@@ -76,6 +79,94 @@ core::arch::global_asm!(include_str!("trap.s"));
 extern "C" {
     fn __fipsos_syscall_entry();
     fn __fipsos_enter_ring3(user_rip: u64, user_rsp: u64) -> i32;
+    fn __fipsos_resume_from_fault(tf: *const TrapFrame) -> !;
+    fn __fipsos_usermode_exit() -> !;
+}
+
+static USER_FAULTS_RECOVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Returns the total number of Ring 3 user faults (`#PF` / `#GP`) safely recovered by the kernel.
+pub fn user_faults_recovered() -> u64 {
+    USER_FAULTS_RECOVERED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Triggers a test Ring 3 user fault recovery verification log message.
+pub fn trigger_ring3_fault_test() {
+    crate::early_println!("[ostd::syscall] Disparando test de recuperacion de fallo en Anillo 3...");
+}
+
+/// Safely recovers from a Ring 3 user-space fault (`#PF` or `#GP`) without halting the kernel.
+///
+/// If a parent process (e.g. Shell or Desktop UI) is stacked waiting on `sys_execve`, restores the parent's
+/// `PML4` in hardware `CR3`, restores its `FpuState` (`FXRSTOR64`), sets the child return code to
+/// `signal_exit_code` (e.g. `-11` for `SIGSEGV` or `-13` for `#GP`), and returns to the parent in Ring 3.
+/// If no parent context exists, returns control to the master kernel loop via `__fipsos_usermode_exit`.
+pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code: i32) -> ! {
+    let count = USER_FAULTS_RECOVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+
+    crate::early_println!(
+        "[USER FAULT RECOVERY] Proceso Anillo 3 abortado con señal {} en RIP={:#x}, CR2={:#x} -> Kernel intacto (Total recuperados={})",
+        signal_exit_code,
+        fault_rip,
+        fault_addr,
+        count
+    );
+    crate::fb_println!(
+        "[USER FAULT RECOVERY] Anillo 3 abortado (Sig={}, RIP={:#x}, CR2={:#x}) -> Kernel intacto",
+        signal_exit_code,
+        fault_rip,
+        fault_addr
+    );
+
+    let faulted_cr3 = crate::mm::active_cr3();
+    let parent_opt = PARENT_CONTEXT_STACK.lock().pop();
+    if let Some(parent_ctx) = parent_opt {
+        // 1. Switch back to parent's isolated PML4 root
+        crate::mm::switch_cr3(parent_ctx.parent_cr3);
+
+        // 2. Reclaim memory of the faulted child process
+        if faulted_cr3 != parent_ctx.parent_cr3 && faulted_cr3 != crate::mm::master_kernel_cr3() {
+            let _ = crate::mm::destroy_process_vm_space(faulted_cr3);
+        }
+
+        // 3. Restore parent's FPU/SSE2 context (FXRSTOR64)
+        parent_ctx.fpu_state.restore();
+
+        // 4. Restore parent's MSR_IA32_FS_BASE (Thread-Local Storage)
+        set_user_fs_base(parent_ctx.user_fs_base);
+
+        // 5. Restore parent's saved_kernel_rsp in CpuLocal
+        unsafe {
+            core::ptr::write_volatile(
+                &raw mut BSP_CPU_LOCAL.saved_kernel_rsp,
+                parent_ctx.saved_kernel_rsp,
+            );
+        }
+
+        // 6. Return to parent process in Ring 3 via iretq with RAX = signal_exit_code
+        let mut tf = parent_ctx.trap_frame;
+        tf.rax = (signal_exit_code as i64) as u64;
+
+        unsafe {
+            __fipsos_resume_from_fault(&tf);
+        }
+    } else {
+        // Top-level Ring 3 process: restore clean Master Kernel PML4
+        crate::mm::switch_cr3(crate::mm::master_kernel_cr3());
+
+        if faulted_cr3 != crate::mm::master_kernel_cr3() {
+            let _ = crate::mm::destroy_process_vm_space(faulted_cr3);
+        }
+
+        unsafe {
+            core::arch::asm!(
+                "mov gs:[0x18], {}",
+                in(reg) (signal_exit_code as i64),
+                options(nostack, preserves_flags)
+            );
+            __fipsos_usermode_exit();
+        }
+    }
 }
 
 /// CPU register context captured by `trap.s` upon a Ring 3 `syscall` instruction.
@@ -105,33 +196,131 @@ pub struct TrapFrame {
 pub enum SyscallAction {
     /// Return to Ring 3 via `sysretq` with `frame.rax` set to the given return value.
     Continue(u64),
-    /// Save the parent process context (e.g. Shell) and enter a child Ring 3 ELF64 binary.
-    SpawnChild { entry_rip: u64, user_rsp: u64 },
+    /// Save the parent process context (including `parent_cr3`) and enter a child Ring 3 ELF64 binary.
+    SpawnChild {
+        entry_rip: u64,
+        user_rsp: u64,
+        parent_cr3: u64,
+    },
     /// Terminate the current Ring 3 execution context with the specified exit status.
     ExitUser(i32),
 }
 
-/// Saved Ring 3 `TrapFrame` and kernel `saved_kernel_rsp` of a parent process waiting on `sys_execve`.
-#[derive(Debug, Clone, Copy)]
+/// Saved Ring 3 `TrapFrame`, `FXSAVE64` `FpuState`, kernel `saved_kernel_rsp`, and hardware `CR3`
+/// (`parent_cr3`) of a parent process waiting on a synchronous `sys_execve`
+/// (supports nested `Shell -> Desktop UI -> App` with full per-process `PML4` isolation).
 struct SavedParentContext {
+    fpu_state: FpuState,
     trap_frame: TrapFrame,
     saved_kernel_rsp: u64,
+    parent_cr3: u64,
+    user_fs_base: u64,
 }
 
-static PARENT_CONTEXT_STACK: SpinLock<Vec<SavedParentContext>> = SpinLock::new(Vec::new());
+static PARENT_CONTEXT_STACK: SpinLock<Vec<Box<SavedParentContext>>> = SpinLock::new(Vec::new());
 
-/// Returns `true` if a parent Ring 3 process (e.g. Shell) is stacked waiting for a child process.
+/// Returns `true` if a parent Ring 3 process (e.g. Shell or Desktop UI) is stacked waiting for a child.
 pub fn has_parent_context() -> bool {
     !PARENT_CONTEXT_STACK.lock().is_empty()
 }
 
-/// Allocates and maps the isolated Ring 3 stack for a child ELF64 process at `0x0090_0000` (`W^X` `R+W`)
-/// and returns its initial 16-byte-ABI-aligned `RSP`.
+/// Returns the `parent_cr3` physical `PML4` address at the top of `PARENT_CONTEXT_STACK`, if any.
+pub fn peek_parent_cr3() -> Option<u64> {
+    PARENT_CONTEXT_STACK.lock().last().map(|ctx| ctx.parent_cr3)
+}
+
+/// Allocates and maps the canonical 16 KiB Ring 3 stack (`0x0080_0000..0x0080_4000`, `W^X` `R+W+NX`)
+/// inside the child process's isolated `CR3` (`PML4`) page table.
 pub fn prepare_child_ring3_stack() -> Result<u64, &'static str> {
+    let stack_base = USER_CHILD_STACK_BASE_VADDR;
     let stack_size = USER_CHILD_STACK_PAGES * PAGE_SIZE;
-    map_user_segment(USER_CHILD_STACK_BASE_VADDR, stack_size, true, false)?;
+    map_user_segment(stack_base, stack_size, true, false)?;
     // System V AMD64 ABI expects (RSP + 8) % 16 == 0 upon entering `extern "C" fn _user_start()`.
-    Ok(USER_CHILD_STACK_BASE_VADDR + (stack_size as u64) - 8)
+    Ok(stack_base + (stack_size as u64) - 8)
+}
+
+/// Sets up the complete System V AMD64 ABI initial stack frame (`argc`, `argv`, `envp`, `auxv`)
+/// in Lower-Half User Space with custom command-line arguments for Linux libc / musl / gcc -static binaries.
+pub fn setup_sysv_abi_user_stack_args(
+    args: &[&str],
+    entry_rip: u64,
+    phdr_vaddr: u64,
+    phent: u16,
+    phnum: u16,
+) -> Result<u64, &'static str> {
+    let stack_base = USER_CHILD_STACK_BASE_VADDR;
+    let stack_size = USER_CHILD_STACK_PAGES * PAGE_SIZE;
+    map_user_segment(stack_base, stack_size, true, false)?;
+
+    // 1. High stack addresses for string data:
+    // Place 16 random bytes at 0x0080_3FE0 for AT_RANDOM
+    let random_vaddr = stack_base + (stack_size as u64) - 32; // 0x0080_3FE0
+    let random_bytes: [u8; 16] = [
+        0x5A, 0x3F, 0x91, 0x2C, 0x88, 0x14, 0x7E, 0xB0,
+        0x19, 0x5C, 0xA4, 0x63, 0xD2, 0x08, 0xFE, 0x47,
+    ];
+    write_user_bytes(random_vaddr, &random_bytes)?;
+
+    let mut str_cursor = random_vaddr;
+    let mut arg_vaddrs = alloc::vec::Vec::new();
+    for arg in args {
+        let bytes = arg.as_bytes();
+        let copy_len = bytes.len();
+        str_cursor = (str_cursor.saturating_sub((copy_len + 1) as u64)) & !7;
+        write_user_bytes(str_cursor, &bytes[..copy_len])?;
+        write_user_bytes(str_cursor + (copy_len as u64), &[0u8])?;
+        arg_vaddrs.push(str_cursor);
+    }
+
+    let argc = arg_vaddrs.len();
+    let total_words = 1 + argc + 1 + 1 + 32;
+    let table_bytes = total_words * 8;
+    let rsp_vaddr = (str_cursor.saturating_sub((table_bytes + 16) as u64)) & !0xF;
+
+    let mut table = alloc::vec![0u64; total_words];
+    table[0] = argc as u64;
+    for (i, &vaddr) in arg_vaddrs.iter().enumerate() {
+        table[1 + i] = vaddr;
+    }
+    table[1 + argc] = 0; // argv[argc] = NULL
+    table[2 + argc] = 0; // envp[0] = NULL
+
+    let mut idx = 3 + argc;
+    // Auxiliary Vector (auxv) entries (type, val)
+    table[idx] = 3; table[idx + 1] = phdr_vaddr; idx += 2; // AT_PHDR
+    table[idx] = 4; table[idx + 1] = phent as u64; idx += 2; // AT_PHENT
+    table[idx] = 5; table[idx + 1] = phnum as u64; idx += 2; // AT_PHNUM
+    table[idx] = 6; table[idx + 1] = 4096; idx += 2; // AT_PAGESZ
+    table[idx] = 7; table[idx + 1] = 0; idx += 2; // AT_BASE
+    table[idx] = 8; table[idx + 1] = 0; idx += 2; // AT_FLAGS
+    table[idx] = 9; table[idx + 1] = entry_rip; idx += 2; // AT_ENTRY
+    table[idx] = 11; table[idx + 1] = 0; idx += 2; // AT_UID
+    table[idx] = 12; table[idx + 1] = 0; idx += 2; // AT_EUID
+    table[idx] = 13; table[idx + 1] = 0; idx += 2; // AT_GID
+    table[idx] = 14; table[idx + 1] = 0; idx += 2; // AT_EGID
+    table[idx] = 23; table[idx + 1] = 0; idx += 2; // AT_SECURE
+    table[idx] = 25; table[idx + 1] = random_vaddr; idx += 2; // AT_RANDOM
+    table[idx] = 0; table[idx + 1] = 0; // AT_NULL
+
+    let mut table_raw = alloc::vec![0u8; total_words * 8];
+    for (i, word) in table.iter().enumerate() {
+        table_raw[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
+    }
+    write_user_bytes(rsp_vaddr, &table_raw)?;
+
+    Ok(rsp_vaddr)
+}
+
+/// Sets up the complete System V AMD64 ABI initial stack frame (`argc`, `argv`, `envp`, `auxv`)
+/// in Lower-Half User Space for single-argument Linux libc / musl / gcc -static binaries.
+pub fn setup_sysv_abi_user_stack(
+    program_path: &str,
+    entry_rip: u64,
+    phdr_vaddr: u64,
+    phent: u16,
+    phnum: u16,
+) -> Result<u64, &'static str> {
+    setup_sysv_abi_user_stack_args(&[program_path], entry_rip, phdr_vaddr, phent, phnum)
 }
 
 /// Type signature for the safe high-level syscall handler registered by `linux_abi`.
@@ -166,14 +355,24 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
         SyscallAction::SpawnChild {
             entry_rip,
             user_rsp,
+            parent_cr3,
         } => {
             // SAFETY: Reading `BSP_CPU_LOCAL.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
             let parent_kernel_rsp =
                 unsafe { core::ptr::read_volatile(&raw const BSP_CPU_LOCAL.saved_kernel_rsp) };
-            PARENT_CONTEXT_STACK.lock().push(SavedParentContext {
+            let parent_fs_base = get_user_fs_base();
+            let mut parent_ctx = Box::new(SavedParentContext {
+                fpu_state: FpuState::new(),
                 trap_frame: *frame,
                 saved_kernel_rsp: parent_kernel_rsp,
+                parent_cr3,
+                user_fs_base: parent_fs_base,
             });
+            parent_ctx.fpu_state.save();
+            PARENT_CONTEXT_STACK.lock().push(parent_ctx);
+
+            // Clean child MSR_IA32_FS_BASE for fresh TLS initialization
+            set_user_fs_base(0);
 
             *frame = TrapFrame {
                 rax: 0,
@@ -196,9 +395,20 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
             0
         }
         SyscallAction::ExitUser(exit_code) => {
+            let exiting_cr3 = crate::mm::active_cr3();
             if let Some(parent_ctx) = PARENT_CONTEXT_STACK.lock().pop() {
+                // Restore the parent's isolated `PML4` root in hardware `CR3` (flushes Lower-Half TLB)
+                crate::mm::switch_cr3(parent_ctx.parent_cr3);
+
+                // Reclaim the exiting child's memory if it had a dedicated CR3
+                if exiting_cr3 != parent_ctx.parent_cr3 && exiting_cr3 != crate::mm::master_kernel_cr3() {
+                    let _ = crate::mm::destroy_process_vm_space(exiting_cr3);
+                }
+
                 *frame = parent_ctx.trap_frame;
                 frame.rax = (exit_code as i64) as u64;
+                parent_ctx.fpu_state.restore();
+                set_user_fs_base(parent_ctx.user_fs_base);
                 // SAFETY: Restoring the parent process's `saved_kernel_rsp` into `BSP_CPU_LOCAL`.
                 unsafe {
                     core::ptr::write_volatile(
@@ -208,6 +418,13 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
                 }
                 0
             } else {
+                // Top-level user process exited: restore the clean Master Kernel `PML4`
+                crate::mm::switch_cr3(crate::mm::master_kernel_cr3());
+
+                if exiting_cr3 != crate::mm::master_kernel_cr3() {
+                    let _ = crate::mm::destroy_process_vm_space(exiting_cr3);
+                }
+
                 // SAFETY: Updating current CPU's `CpuLocal.user_exit_code` via `gs:[0x18]`.
                 unsafe {
                     core::arch::asm!(
@@ -294,6 +511,14 @@ pub fn enter_ring3_at(entry_rip: u64) -> Result<i32, &'static str> {
     Ok(exit_code)
 }
 
+/// Transitions the CPU to **Ring 3 (`CPL=3`)** with an already configured System V ABI stack (`user_rsp`)
+/// starting at `entry_rip`, and returns the exit status when the user program invokes `sys_exit`.
+pub fn enter_ring3_sysv(entry_rip: u64, user_rsp: u64) -> Result<i32, &'static str> {
+    // SAFETY: `entry_rip` and `user_rsp` are mapped in Lower-Half User Space with PTE_USER.
+    let exit_code = unsafe { __fipsos_enter_ring3(entry_rip, user_rsp) };
+    Ok(exit_code)
+}
+
 #[inline]
 unsafe fn rdmsr(msr: u32) -> u64 {
     let low: u32;
@@ -325,4 +550,16 @@ unsafe fn wrmsr(msr: u32, value: u64) {
             options(nomem, nostack, preserves_flags)
         );
     }
+}
+
+/// Reads the current Ring 3 `MSR_IA32_FS_BASE` (Thread-Local Storage base).
+pub fn get_user_fs_base() -> u64 {
+    // SAFETY: Reading architectural MSR_IA32_FS_BASE.
+    unsafe { rdmsr(MSR_IA32_FS_BASE) }
+}
+
+/// Sets the Ring 3 `MSR_IA32_FS_BASE` (Thread-Local Storage base).
+pub fn set_user_fs_base(addr: u64) {
+    // SAFETY: Writing architectural MSR_IA32_FS_BASE.
+    unsafe { wrmsr(MSR_IA32_FS_BASE, addr) };
 }

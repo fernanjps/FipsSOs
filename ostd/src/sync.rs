@@ -32,6 +32,19 @@ impl<T> SpinLock<T> {
         }
         SpinLockGuard { lock: self }
     }
+
+    /// Attempts to acquire the lock without spinning (safe for hardware IRQ handlers).
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(SpinLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
 }
 
 /// RAII guard that releases the `SpinLock` when dropped.

@@ -276,6 +276,12 @@ pub fn deallocate_contiguous_frames(base_paddr: PhysAddr, count: usize) {
     with_allocator(|alloc| alloc.deallocate_contiguous(base_paddr, count));
 }
 
+/// Deallocates a single 4 KiB physical frame starting at `paddr`.
+#[inline]
+pub fn deallocate_frame(paddr: PhysAddr) {
+    deallocate_contiguous_frames(paddr, 1);
+}
+
 /// Returns current physical memory allocation statistics.
 pub fn stats() -> MemoryStats {
     with_allocator(|alloc| alloc.stats())

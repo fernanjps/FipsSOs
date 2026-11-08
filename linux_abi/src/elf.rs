@@ -40,6 +40,9 @@ pub struct LoadedElf64 {
     pub elf_type: u16,
     pub segments_loaded: usize,
     pub total_mapped_bytes: usize,
+    pub phdr_vaddr: VirtAddr,
+    pub phentsize: u16,
+    pub phnum: u16,
 }
 
 /// Safe ELF64 (`ET_EXEC` / `ET_DYN` `x86_64`) parser and loader for `linux_abi`.
@@ -94,6 +97,7 @@ impl Elf64Loader {
 
         let mut segments_loaded = 0usize;
         let mut total_mapped_bytes = 0usize;
+        let mut phdr_vaddr = 0u64;
 
         for i in 0..e_phnum {
             let ph_base = e_phoff + i * e_phentsize;
@@ -122,6 +126,11 @@ impl Elf64Loader {
                 return Err(ElfError::SegmentOutOfBounds);
             }
 
+            // Check if this segment contains the ELF Program Header Table
+            if p_offset <= e_phoff && (p_offset + p_filesz) >= ph_table_end {
+                phdr_vaddr = p_vaddr + ((e_phoff - p_offset) as u64);
+            }
+
             let writable = (p_flags & PF_W) != 0;
             let executable = (p_flags & PF_X) != 0;
             if writable && executable {
@@ -139,6 +148,20 @@ impl Elf64Loader {
                     .map_err(ElfError::MappingFailed)?;
             }
 
+            // Cleanly zero out .bss region (p_filesz..p_memsz)
+            if p_memsz > p_filesz {
+                let bss_start = p_vaddr + (p_filesz as u64);
+                let bss_len = p_memsz - p_filesz;
+                let zero_buf = [0u8; 512];
+                let mut written = 0;
+                while written < bss_len {
+                    let chunk = core::cmp::min(bss_len - written, zero_buf.len());
+                    write_user_bytes(bss_start + (written as u64), &zero_buf[..chunk])
+                        .map_err(ElfError::MappingFailed)?;
+                    written += chunk;
+                }
+            }
+
             // Apply final strict W^X permissions (clears PTE_WRITABLE if !writable, sets PTE_NX_BIT if !executable)
             protect_user_segment(p_vaddr, p_memsz, writable, executable)
                 .map_err(ElfError::MappingFailed)?;
@@ -151,17 +174,23 @@ impl Elf64Loader {
             return Err(ElfError::NoLoadableSegments);
         }
 
+        if phdr_vaddr == 0 {
+            phdr_vaddr = load_bias + (e_phoff as u64);
+        }
+
         ostd::early_println!(
-            "[linux_abi::elf] Binario ELF64 x86_64 cargado con W^X ({} segmento(s) PT_LOAD, {} bytes) -> EntryPoint={:#x}",
+            "[linux_abi::elf] Binario ELF64 x86_64 cargado con W^X ({} segmento(s) PT_LOAD, {} bytes) -> EntryPoint={:#x} PHDR={:#x}",
             segments_loaded,
             total_mapped_bytes,
-            entry_point
+            entry_point,
+            phdr_vaddr
         );
         ostd::fb_println!(
-            "[linux_abi::elf] Binario ELF64 x86_64 cargado con W^X ({} segmento(s) PT_LOAD, {} bytes) -> EntryPoint={:#x}",
+            "[linux_abi::elf] Binario ELF64 x86_64 cargado con W^X ({} segmento(s) PT_LOAD, {} bytes) -> EntryPoint={:#x} PHDR={:#x}",
             segments_loaded,
             total_mapped_bytes,
-            entry_point
+            entry_point,
+            phdr_vaddr
         );
 
         Ok(LoadedElf64 {
@@ -169,6 +198,9 @@ impl Elf64Loader {
             elf_type: e_type,
             segments_loaded,
             total_mapped_bytes,
+            phdr_vaddr,
+            phentsize: e_phentsize as u16,
+            phnum: e_phnum as u16,
         })
     }
 
@@ -209,8 +241,9 @@ impl Elf64Loader {
         img[ph + 8..ph + 16].copy_from_slice(&(segment_file_offset as u64).to_le_bytes()); // p_offset
         img[ph + 16..ph + 24].copy_from_slice(&segment_vaddr.to_le_bytes()); // p_vaddr
         img[ph + 24..ph + 32].copy_from_slice(&segment_vaddr.to_le_bytes()); // p_paddr
+        let mem_size = ((payload_size + 4095) & !4095) as u64;
         img[ph + 32..ph + 40].copy_from_slice(&(payload_size as u64).to_le_bytes()); // p_filesz
-        img[ph + 40..ph + 48].copy_from_slice(&4096u64.to_le_bytes()); // p_memsz (1 page)
+        img[ph + 40..ph + 48].copy_from_slice(&mem_size.to_le_bytes()); // p_memsz
         img[ph + 48..ph + 56].copy_from_slice(&4096u64.to_le_bytes()); // p_align
 
         // 3. Copy code and rodata into the PT_LOAD payload

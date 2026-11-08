@@ -9,6 +9,7 @@ pub const GENERAL_PROTECTION_FAULT_VECTOR: usize = 13;
 pub const PAGE_FAULT_VECTOR: usize = 14;
 pub const TIMER_INTERRUPT_VECTOR: usize = 32; // IRQ0 remapped to 0x20
 pub const KEYBOARD_INTERRUPT_VECTOR: usize = 33; // IRQ1 remapped to 0x21
+pub const MOUSE_INTERRUPT_VECTOR: usize = 44; // IRQ12 remapped to 0x2C (Slave PIC line 4)
 
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -111,10 +112,13 @@ core::arch::global_asm!(
     "push r10",
     "push r11",
     "push rbp",
-    "lea rdi, [rsp + 80]",
     "mov rbp, rsp",
+    "sub rsp, 512",
     "and rsp, -16",
+    "fxsave64 [rsp]",
+    "lea rdi, [rbp + 80]",
     "call __rust_timer_irq_handler",
+    "fxrstor64 [rsp]",
     "mov rsp, rbp",
     "pop rbp",
     "pop r11",
@@ -141,8 +145,42 @@ core::arch::global_asm!(
     "push r11",
     "push rbp",
     "mov rbp, rsp",
+    "sub rsp, 512",
     "and rsp, -16",
+    "fxsave64 [rsp]",
     "call __rust_keyboard_irq_handler",
+    "fxrstor64 [rsp]",
+    "mov rsp, rbp",
+    "pop rbp",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "iretq",
+
+    ".global __isr_mouse_irq",
+    "__isr_mouse_irq:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push rbp",
+    "mov rbp, rsp",
+    "sub rsp, 512",
+    "and rsp, -16",
+    "fxsave64 [rsp]",
+    "call __rust_mouse_irq_handler",
+    "fxrstor64 [rsp]",
     "mov rsp, rbp",
     "pop rbp",
     "pop r11",
@@ -167,6 +205,7 @@ extern "C" {
     fn __isr_page_fault();
     fn __isr_timer_irq();
     fn __isr_keyboard_irq();
+    fn __isr_mouse_irq();
     fn __isr_spurious_irq();
 }
 
@@ -189,8 +228,16 @@ extern "C" fn __rust_general_protection_fault_handler(
     frame: &InterruptStackFrame,
     error_code: u64,
 ) -> ! {
+    if (frame.code_segment & 0b11) == 3 {
+        // Fault occurred in Ring 3 User Space: restore kernel GS and safely recover
+        unsafe {
+            core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+        }
+        super::syscall::recover_from_user_fault(frame.instruction_pointer, 0, -13);
+    }
+
     crate::early_println!(
-        "\n[EXCEPTION #GP] General Protection Fault (error_code={:#x}) @ RIP={:#x}, CS={:#x}, RSP={:#x}",
+        "\n[EXCEPTION #GP KERNEL PANIC] General Protection Fault (error_code={:#x}) @ RIP={:#x}, CS={:#x}, RSP={:#x}",
         error_code,
         frame.instruction_pointer,
         frame.code_segment,
@@ -210,8 +257,16 @@ extern "C" fn __rust_page_fault_handler(
     let user = (error_code & (1 << 2)) != 0;
     let instruction_fetch = (error_code & (1 << 4)) != 0;
 
+    if (frame.code_segment & 0b11) == 3 || user {
+        // Fault occurred in Ring 3 User Space: restore kernel GS and safely recover
+        unsafe {
+            core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+        }
+        super::syscall::recover_from_user_fault(frame.instruction_pointer, fault_addr, -11);
+    }
+
     crate::early_println!(
-        "\n[EXCEPTION #PF] Page Fault en CR2={:#x} (error_code={:#x}: present={}, write={}, user={}, ifetch={}) @ RIP={:#x}",
+        "\n[EXCEPTION #PF KERNEL PANIC] Page Fault en CR2={:#x} (error_code={:#x}: present={}, write={}, user={}, ifetch={}) @ RIP={:#x}",
         fault_addr,
         error_code,
         present,
@@ -252,7 +307,19 @@ extern "C" fn __rust_keyboard_irq_handler() {
     }
 }
 
-/// Remaps the legacy 8259 PIC to vectors `0x20..0x2F` and configures PIT Channel 0.
+#[no_mangle]
+extern "C" fn __rust_mouse_irq_handler() {
+    super::mouse::on_irq12();
+    // Send End-Of-Interrupt (EOI = 0x20) to BOTH Slave 8259 PIC (0xA0) and Master 8259 PIC (0x20)
+    // SAFETY: Standard cascaded 8259 PIC EOI sequence for IRQ8..IRQ15 in Ring 0.
+    unsafe {
+        outb(0xA0, 0x20);
+        outb(0x20, 0x20);
+    }
+}
+
+/// Remaps the legacy 8259 PIC to vectors `0x20..0x2F`, unmasks `IRQ0` (Timer), `IRQ1` (Keyboard),
+/// `IRQ2` (Slave Cascade), and `IRQ12` (PS/2 Mouse), and configures PIT Channel 0 (~100 Hz).
 unsafe fn init_pic_and_pit() {
     // SAFETY: Standard x86 8259 PIC & 8254 PIT I/O port initialization in Ring 0.
     unsafe {
@@ -269,9 +336,10 @@ unsafe fn init_pic_and_pit() {
         outb(0x21, 0x01);
         outb(0xA1, 0x01);
 
-        // Unmask IRQ0 (Timer) and IRQ1 (PS/2 Keyboard) on Master PIC (0xFC), mask all on Slave PIC (0xFF)
-        outb(0x21, 0xFC);
-        outb(0xA1, 0xFF);
+        // Master PIC (0x21) mask = 0xF8: allow IRQ0 (Timer), IRQ1 (Keyboard), IRQ2 (Cascade)
+        // Slave PIC  (0xA1) mask = 0xEF: allow IRQ12 (line 4 on Slave PIC = PS/2 Mouse)
+        outb(0x21, 0xF8);
+        outb(0xA1, 0xEF);
 
         // Configure 8254 PIT Channel 0: rate generator (mode 2), ~100 Hz (divisor = 11931 = 0x2E9B)
         outb(0x43, 0x34);
@@ -316,6 +384,8 @@ pub fn init() {
             .set_handler(__isr_timer_irq as *const () as usize, 0);
         IDT.entries[KEYBOARD_INTERRUPT_VECTOR]
             .set_handler(__isr_keyboard_irq as *const () as usize, 0);
+        IDT.entries[MOUSE_INTERRUPT_VECTOR]
+            .set_handler(__isr_mouse_irq as *const () as usize, 0);
 
         let idtr = DescriptorTablePointer {
             limit: (size_of::<IdtTable>() - 1) as u16,
@@ -324,19 +394,21 @@ pub fn init() {
 
         core::arch::asm!("lidt [{idtr}]", idtr = in(reg) &idtr, options(preserves_flags));
 
-        init_pic_and_pit();
         super::keyboard::init();
+        super::mouse::init();
+        init_pic_and_pit();
         // Trigger a self-test software interrupt on Timer Vector 0x20 to verify IDT dispatch
         core::arch::asm!("int 0x20", options(preserves_flags));
     }
 
     crate::early_println!(
-        "[ostd::arch::idt] IDT cargada (#DF={}, #GP={}, #PF={}, Timer={:#x}, Keyboard IRQ1={:#x}, PIC mask=0xFC)",
+        "[ostd::arch::idt] IDT cargada (#DF={}, #GP={}, #PF={}, Timer={:#x}, Key={:#x}, Mouse IRQ12={:#x}, PIC=0xF8/0xEF)",
         DOUBLE_FAULT_VECTOR,
         GENERAL_PROTECTION_FAULT_VECTOR,
         PAGE_FAULT_VECTOR,
         TIMER_INTERRUPT_VECTOR,
-        KEYBOARD_INTERRUPT_VECTOR
+        KEYBOARD_INTERRUPT_VECTOR,
+        MOUSE_INTERRUPT_VECTOR
     );
 }
 
@@ -344,4 +416,16 @@ pub fn init() {
 #[inline]
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Reloads the IDTR register on an Application Processor (`AP`).
+pub fn load_idtr() {
+    // SAFETY: Loading IDTR with the initialized kernel IDT in Ring 0.
+    unsafe {
+        let idtr = DescriptorTablePointer {
+            limit: (size_of::<IdtTable>() - 1) as u16,
+            base: (&raw const IDT) as u64,
+        };
+        core::arch::asm!("lidt [{idtr}]", idtr = in(reg) &idtr, options(preserves_flags));
+    }
 }

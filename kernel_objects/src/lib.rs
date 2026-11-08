@@ -23,4 +23,8 @@ pub use handle::{HandleEntry, HandleError, HandleId, HandleTable, Rights};
 pub use object::{KernelObject, Koid, ObjectType};
 pub use process::{Process, ProcessState, ProcessThreadRecord, SchedulerRegistry};
 pub use thread::{Thread, ThreadState};
-pub use vmo::{Vmo, VmoError, VmoUsage};
+pub use vmo::{
+    Vmo, VmoCqEntry, VmoError, VmoRingHeader, VmoSqEntry, VmoUsage, VMO_RING_MAGIC,
+    VMO_RING_OP_3D_TRANSFORM, VMO_RING_OP_ECHO, VMO_RING_OP_MEM_CRC, VMO_RING_OP_NET_POLL,
+    VMO_RING_OP_NOP, VMO_RING_QUEUE_DEPTH, VMO_RING_VERSION,
+};

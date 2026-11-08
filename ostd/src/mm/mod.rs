@@ -7,10 +7,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::memory_map::Entry;
 
 pub use dma::{DmaBuffer, DmaError, VmFrame};
-pub use frame::{FrameAllocator, MemoryStats};
+pub use frame::{deallocate_frame, stats as memory_stats, FrameAllocator, MemoryStats};
 pub use vm_space::{
-    expand_user_brk, map_user_segment, map_vmo_to_user, protect_user_segment, read_user_bytes,
-    reset_user_brk, validate_user_buffer, write_user_bytes, USER_HEAP_BASE_VADDR,
+    active_cr3, create_process_pml4, destroy_process_vm_space, expand_user_brk,
+    map_anonymous_user_memory, map_kernel_mmio, map_user_segment, map_vmo_to_user,
+    master_kernel_cr3, protect_user_segment, read_user_bytes, reset_user_brk, switch_cr3,
+    validate_user_buffer, write_user_bytes, ProcessVmSpace, USER_HEAP_BASE_VADDR,
     USER_HEAP_MAX_VADDR, USER_MMAP_BASE_VADDR, USER_SPACE_LOW_BASE, USER_STACK_DEFAULT_BASE,
 };
 
@@ -52,10 +54,14 @@ pub fn init(hhdm_offset: u64, memory_map: &[&Entry]) {
         heap::init(heap_virt, KERNEL_HEAP_SIZE);
     }
 
+    // 3. Record the bootloader's active Ring 0 PML4 as MASTER_KERNEL_PML4 for per-process CR3 cloning
+    vm_space::init_kernel_vm_space();
+
     let stats = frame::stats();
     crate::early_println!(
-        "[ostd::mm] HHDM offset={:#x} | RAM Usable={} MiB ({} frames libres, {} usados) | Heap={} MiB @ {:#x}",
+        "[ostd::mm] HHDM offset={:#x} | MasterCR3={:#x} | RAM Usable={} MiB ({} frames libres, {} usados) | Heap={} MiB @ {:#x}",
         hhdm_offset,
+        vm_space::master_kernel_cr3(),
         stats.total_bytes() / (1024 * 1024),
         stats.free_frames,
         stats.used_frames,

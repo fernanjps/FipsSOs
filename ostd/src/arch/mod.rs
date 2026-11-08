@@ -5,7 +5,7 @@ pub mod x86_64;
 pub mod aarch64;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{fpu, halt_loop, idt, init, keyboard, serial, syscall, topology};
+pub use x86_64::{audio, fpu, halt_loop, idt, init, keyboard, mouse, sensors, serial, syscall, topology};
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{halt_loop, init, serial, syscall, topology};

@@ -26,6 +26,12 @@ impl Koid {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Constructs a `Koid` from an existing raw 64-bit identifier value.
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 impl fmt::Display for Koid {

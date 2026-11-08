@@ -65,6 +65,19 @@ struct DescriptorTablePointer {
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 static mut GDT: GdtTable = GdtTable { entries: [0; 7] };
 
+static mut AP_TSS: [TaskStateSegment; 4] = [
+    TaskStateSegment::new(),
+    TaskStateSegment::new(),
+    TaskStateSegment::new(),
+    TaskStateSegment::new(),
+];
+static mut AP_GDT: [GdtTable; 4] = [
+    GdtTable { entries: [0; 7] },
+    GdtTable { entries: [0; 7] },
+    GdtTable { entries: [0; 7] },
+    GdtTable { entries: [0; 7] },
+];
+
 /// Initializes the x86_64 GDT (Ring 0 & Ring 3 segments) and loads the TSS.
 pub fn init() {
     // SAFETY: Executed once on the BSP during early boot before SMP or preemption.
@@ -131,5 +144,60 @@ pub fn init() {
         USER_CODE_SELECTOR,
         USER_DATA_SELECTOR,
         TSS_SELECTOR
+    );
+}
+
+/// Initializes a dedicated GDT and TSS for an Application Processor (`AP`),
+/// loading `GDTR`, resetting segment registers (`CS=0x08`, `DS/ES/SS=0x10`), and loading `TR=0x28`.
+pub unsafe fn init_ap_gdt(cpu_id: usize, stack_top: u64) {
+    let idx = cpu_id.min(3);
+    let tss = &raw mut AP_TSS[idx];
+    (*tss).privilege_stack_table[0] = stack_top;
+    (*tss).interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = stack_top;
+    (*tss).iomap_base = size_of::<TaskStateSegment>() as u16;
+
+    let tss_base = tss as u64;
+    let tss_limit = (size_of::<TaskStateSegment>() - 1) as u64;
+
+    let tss_low = (tss_limit & 0xFFFF)
+        | ((tss_base & 0xFFFFFF) << 16)
+        | (0x89u64 << 40) // Present=1, DPL=0, Type=0x9 (Available 64-bit TSS)
+        | (((tss_limit >> 16) & 0xF) << 48)
+        | (((tss_base >> 24) & 0xFF) << 56);
+    let tss_high = tss_base >> 32;
+
+    let gdt = &raw mut AP_GDT[idx];
+    (*gdt).entries[0] = 0;
+    (*gdt).entries[1] = 0x00AF_9A00_0000_FFFF; // 0x08: Kernel Code
+    (*gdt).entries[2] = 0x00CF_9200_0000_FFFF; // 0x10: Kernel Data
+    (*gdt).entries[3] = 0x00CF_F200_0000_FFFF; // 0x18: User Data
+    (*gdt).entries[4] = 0x00AF_FA00_0000_FFFF; // 0x20: User Code
+    (*gdt).entries[5] = tss_low;              // 0x28: TSS low
+    (*gdt).entries[6] = tss_high;             // 0x30: TSS high
+
+    let gdtr = DescriptorTablePointer {
+        limit: (size_of::<GdtTable>() - 1) as u16,
+        base: gdt as u64,
+    };
+
+    core::arch::asm!(
+        "lgdt [{gdtr}]",
+        "push {kcode}",
+        "lea {tmp}, [rip + 2f]",
+        "push {tmp}",
+        "retfq",
+        "2:",
+        "mov ax, {kdata:x}",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov ss, ax",
+        "ltr {tss:x}",
+        gdtr = in(reg) &gdtr,
+        kcode = const KERNEL_CODE_SELECTOR as u64,
+        kdata = in(reg) KERNEL_DATA_SELECTOR,
+        tss = in(reg) TSS_SELECTOR,
+        tmp = lateout(reg) _,
+        out("ax") _,
+        options(preserves_flags)
     );
 }

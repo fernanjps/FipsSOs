@@ -12,9 +12,9 @@ use libfipsos::{
 ostd::user_main!(npu_infer_main);
 
 fn npu_infer_main() -> i32 {
-    // 1. Announce native Rust ELF64 execution in Ring 3 at RIP = 0x0050_0000
+    // 1. Announce native Rust ELF64 execution in Ring 3 at unified canonical base 0x0040_0000 (isolated CR3)
     print(
-        "[npu_infer.elf] Binario ELF64 compilado en Rust nativo ejecutandose en Anillo 3 (RIP=0x500000)!\n",
+        "[npu_infer.elf] Binario ELF64 en Rust ejecutandose en Anillo 3 (Base=0x400000, CR3 aislado)!\n",
     );
 
     // 2. Query our Process KOID via sys_getpid (39) and cooperatively yield via sys_sched_yield (24)

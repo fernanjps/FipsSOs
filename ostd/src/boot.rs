@@ -1,6 +1,6 @@
 use limine::request::{
-    FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
-    RequestsStartMarker,
+    ExecutableFileRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
+    MpRequest, RequestsEndMarker, RequestsStartMarker,
 };
 use limine::BaseRevision;
 
@@ -33,6 +33,16 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+/// Requests Symmetric Multi-Processing (SMP / MP) topology and AP startup from Limine.
+#[used]
+#[link_section = ".limine_requests"]
+static MP_REQUEST: MpRequest = MpRequest::new();
+
+/// Requests the kernel executable file and cmdline from the Limine bootloader.
+#[used]
+#[link_section = ".limine_requests"]
+static EXECUTABLE_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
 /// Marks the end of the Limine boot request section.
 #[used]
@@ -132,6 +142,8 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::fpu::init();
     crate::arch::init();
+    crate::net::init();
+    crate::storage::init();
 
     if let Some(initramfs) = initramfs_slice() {
         crate::early_println!(
@@ -157,4 +169,20 @@ pub fn initramfs_slice() -> Option<&'static [u8]> {
     }
     // SAFETY: Limine maps module memory into Higher-Half HHDM for the lifetime of the kernel.
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+/// Returns the Limine MP / SMP response if present.
+pub fn smp_response() -> Option<&'static limine::response::MpResponse> {
+    MP_REQUEST.get_response()
+}
+
+/// Returns the Limine executable file response, if available.
+pub fn executable_file_response() -> Option<&'static limine::response::ExecutableFileResponse> {
+    EXECUTABLE_FILE_REQUEST.get_response()
+}
+
+/// Returns the kernel boot command line string if passed by the bootloader.
+pub fn kernel_cmdline() -> Option<&'static str> {
+    let resp = executable_file_response()?;
+    resp.file().string().to_str().ok()
 }

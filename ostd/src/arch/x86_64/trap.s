@@ -61,6 +61,7 @@ __fipsos_syscall_entry:
     pop r15
     pop rcx
     pop r11
+    cli
     pop rsp
 
     swapgs
@@ -127,3 +128,38 @@ __fipsos_usermode_exit:
     pop rbx
     pop rbp
     ret
+
+.global __fipsos_resume_from_fault
+__fipsos_resume_from_fault:
+    /* RDI = const TrapFrame* */
+    /* Set up user data segment selectors for Ring 3 */
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+
+    /* Build iretq stack frame */
+    push 0x1b                   /* SS = 0x18 | RPL 3 */
+    push qword ptr [rdi + 120]  /* user_rsp */
+    push qword ptr [rdi + 112]  /* user_rflags */
+    push 0x23                   /* CS = 0x20 | RPL 3 */
+    push qword ptr [rdi + 104]  /* user_rip */
+
+    /* Restore GPRs from TrapFrame */
+    mov rax, [rdi + 0]
+    mov rsi, [rdi + 16]
+    mov rdx, [rdi + 24]
+    mov r10, [rdi + 32]
+    mov r8,  [rdi + 40]
+    mov r9,  [rdi + 48]
+    mov rbx, [rdi + 56]
+    mov rbp, [rdi + 64]
+    mov r12, [rdi + 72]
+    mov r13, [rdi + 80]
+    mov r14, [rdi + 88]
+    mov r15, [rdi + 96]
+    mov rdi, [rdi + 8]          /* restore rdi last */
+
+    /* Swap kernel GS out so user GS is active */
+    swapgs
+    iretq
+

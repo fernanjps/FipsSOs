@@ -13,8 +13,8 @@ PROVIDE(__fipsos_kernel_main_entry = 0);
 
 SECTIONS
 {
-    /* Base User-Space Virtual Address for /bin/npu_infer.elf (distinct from Shell @ 0x00400000) */
-    . = 0x0000000000500000;
+    /* Unified Canonical Linux x86_64 User Base (0x00400000) isolated by dedicated Process CR3/PML4 */
+    . = 0x0000000000400000;
 
     .text ALIGN(0x1000) : {
         KEEP(*(.text._user_start))

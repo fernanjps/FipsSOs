@@ -45,6 +45,16 @@ pub struct HandleId(u32);
 
 impl HandleId {
     #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn null() -> Self {
+        Self(0)
+    }
+
+    #[inline]
     pub const fn raw(self) -> u32 {
         self.0
     }

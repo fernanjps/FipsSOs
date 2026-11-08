@@ -8,8 +8,8 @@ pub const PS2_STATUS_PORT: u16 = 0x64;
 
 const KEY_RING_CAPACITY: usize = 256;
 
-/// Scancode Set 1 unshifted lookup table for make codes `0x00..0x58`.
-static SCANCODE_SET1_NORMAL: [u8; 89] = [
+/// Scancode Set 1 unshifted lookup table for make codes `0x00..0x5D` (`0x5B`/`0x5C` = Windows Super Key -> `0x11`).
+static SCANCODE_SET1_NORMAL: [u8; 93] = [
     0,    0x1B, b'1', b'2', b'3', b'4', b'5', b'6', // 0x00..0x07
     b'7', b'8', b'9', b'0', b'-', b'=', 0x08, b' ', // 0x08..0x0F (0x0E = Backspace, 0x0F = Tab->Space)
     b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', // 0x10..0x17
@@ -21,11 +21,11 @@ static SCANCODE_SET1_NORMAL: [u8; 89] = [
     0,    0,    0,    0,    0,    0,    0,    b'7', // 0x40..0x47
     b'8', b'9', b'-', b'4', b'5', b'6', b'+', b'1', // 0x48..0x4F
     b'2', b'3', b'0', b'.', 0,    0,    0,    0,    // 0x50..0x57
-    0,                                              // 0x58
+    0,    0,    0,    0x11, 0x11,                   // 0x58..0x5C (0x5B = LWin, 0x5C = RWin)
 ];
 
-/// Scancode Set 1 shifted lookup table for make codes `0x00..0x58`.
-static SCANCODE_SET1_SHIFTED: [u8; 89] = [
+/// Scancode Set 1 shifted lookup table for make codes `0x00..0x5D`.
+static SCANCODE_SET1_SHIFTED: [u8; 93] = [
     0,    0x1B, b'!', b'@', b'#', b'$', b'%', b'^', // 0x00..0x07
     b'&', b'*', b'(', b')', b'_', b'+', 0x08, b' ', // 0x08..0x0F
     b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', // 0x10..0x17
@@ -37,7 +37,7 @@ static SCANCODE_SET1_SHIFTED: [u8; 89] = [
     0,    0,    0,    0,    0,    0,    0,    b'7', // 0x40..0x47
     b'8', b'9', b'-', b'4', b'5', b'6', b'+', b'1', // 0x48..0x4F
     b'2', b'3', b'0', b'.', 0,    0,    0,    0,    // 0x50..0x57
-    0,                                              // 0x58
+    0,    0,    0,    0x11, 0x11,                   // 0x58..0x5C
 ];
 
 struct KeyboardState {
@@ -48,6 +48,7 @@ struct KeyboardState {
     left_shift: bool,
     right_shift: bool,
     caps_lock: bool,
+    extended: bool,
     waker: Option<Waker>,
 }
 
@@ -61,6 +62,7 @@ impl KeyboardState {
             left_shift: false,
             right_shift: false,
             caps_lock: false,
+            extended: false,
             waker: None,
         }
     }
@@ -85,8 +87,73 @@ impl KeyboardState {
     }
 
     fn handle_scancode(&mut self, scancode: u8) -> Option<Waker> {
+        if scancode == 0xE0 {
+            self.extended = true;
+            return None;
+        }
+
+        if self.extended {
+            self.extended = false;
+            // Ignore break codes for extended keys (scancode & 0x80 != 0)
+            if (scancode & 0x80) != 0 {
+                return None;
+            }
+            return match scancode {
+                // Arrow Up -> ANSI "\x1b[A"
+                0x48 => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'A');
+                    w1.or(w2).or(w3)
+                }
+                // Arrow Down -> ANSI "\x1b[B"
+                0x50 => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'B');
+                    w1.or(w2).or(w3)
+                }
+                // Arrow Right -> ANSI "\x1b[C"
+                0x4D => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'C');
+                    w1.or(w2).or(w3)
+                }
+                // Arrow Left -> ANSI "\x1b[D"
+                0x4B => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'D');
+                    w1.or(w2).or(w3)
+                }
+                // Home -> ANSI "\x1b[H"
+                0x47 => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'H');
+                    w1.or(w2).or(w3)
+                }
+                // End -> ANSI "\x1b[F"
+                0x4F => {
+                    let w1 = self.push_byte(0x1B);
+                    let w2 = self.push_byte(b'[');
+                    let w3 = self.push_byte(b'F');
+                    w1.or(w2).or(w3)
+                }
+                // Delete -> 0x7F (ASCII DEL)
+                0x53 => self.push_byte(0x7F),
+                // Left Win (0x5B) / Right Win (0x5C) -> 0x11 (DC1 / Win Super key)
+                0x5B | 0x5C => self.push_byte(0x11),
+                // Keypad Enter (0x1C with E0)
+                0x1C => self.push_byte(b'\n'),
+                // Keypad / (0x35 with E0)
+                0x35 => self.push_byte(b'/'),
+                _ => None,
+            };
+        }
+
         match scancode {
-            0xE0 => None, // Extended prefix
             0x2A => {
                 self.left_shift = true;
                 None
@@ -156,9 +223,28 @@ pub fn init() {
 
 /// Invoked from `__rust_keyboard_irq_handler` (`IRQ1`, Vector `0x21`) when a key event arrives.
 pub(crate) fn on_irq1() {
-    // SAFETY: Reading scancode from PS/2 data port 0x60 during IRQ1 service routine.
-    let scancode = unsafe { inb(PS2_DATA_PORT) };
-    let waker = KEYBOARD.lock().handle_scancode(scancode);
+    // SAFETY: Reading PS/2 status (0x64) and data port (0x60) during IRQ1 service routine.
+    unsafe {
+        let status = inb(PS2_STATUS_PORT);
+        if (status & 0x01) == 0 {
+            return;
+        }
+        let byte = inb(PS2_DATA_PORT);
+        if (status & 0x20) != 0 {
+            super::mouse::process_packet_byte(byte);
+            return;
+        }
+        process_scancode_from_aux_poll(byte);
+    }
+}
+
+/// Processes a keyboard scancode read from port `0x60` when `status & 0x20 == 0`.
+pub(crate) fn process_scancode_from_aux_poll(scancode: u8) {
+    let waker = if let Some(mut guard) = KEYBOARD.try_lock() {
+        guard.handle_scancode(scancode)
+    } else {
+        None
+    };
     if let Some(w) = waker {
         w.wake();
     }
@@ -186,15 +272,20 @@ pub fn try_pop_key_nonblocking() -> Option<u8> {
         return Some(ch);
     }
 
-    // Drain up to 4 pending hardware PS/2 bytes in case a key was pressed while IF=0 during a syscall
+    // Drain up to 4 pending hardware PS/2 bytes in case a key/mouse byte arrived while IF=0 during a syscall
     // SAFETY: Reading PS/2 status port (0x64) and data port (0x60) in Ring 0.
     unsafe {
         for _ in 0..4 {
-            if (inb(PS2_STATUS_PORT) & 0x01) != 0 {
-                let scancode = inb(PS2_DATA_PORT);
-                let waker = KEYBOARD.lock().handle_scancode(scancode);
-                if let Some(w) = waker {
-                    w.wake();
+            let status = inb(PS2_STATUS_PORT);
+            if (status & 0x01) != 0 {
+                let data = inb(PS2_DATA_PORT);
+                if (status & 0x20) != 0 {
+                    super::mouse::process_packet_byte(data);
+                } else {
+                    let waker = KEYBOARD.lock().handle_scancode(data);
+                    if let Some(w) = waker {
+                        w.wake();
+                    }
                 }
             } else {
                 break;
@@ -216,6 +307,8 @@ pub fn read_char_blocking() -> u8 {
         if let Some(ch) = try_read_char() {
             return ch;
         }
+        // Idle Power Governor: record idle tick on Core 0 while sleeping in HLT
+        crate::scheduler::record_idle_tick(0);
         // SAFETY: Enabling interrupts and halting the CPU core until the next hardware IRQ
         // (`IRQ1` keyboard or `IRQ0` timer) wakes the processor.
         unsafe {

@@ -7,8 +7,11 @@ pub mod boot;
 pub mod bus;
 pub mod fb_console;
 pub mod ffi_jail;
+pub mod ipc;
 pub mod mm;
+pub mod net;
 pub mod scheduler;
+pub mod storage;
 pub mod sync;
 pub mod user;
 
