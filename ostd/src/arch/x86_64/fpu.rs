@@ -9,9 +9,10 @@ const CR0_EM: u64 = 1 << 2; // Emulation (must be 0 for hardware FPU/SSE)
 const CR0_TS: u64 = 1 << 3; // Task Switched (clear to 0)
 const CR0_NE: u64 = 1 << 5; // Numeric Error native mode (1)
 
-/// CR4 bit flags for FXSAVE64/FXRSTOR64 and SSE/SSE2 XMM0..XMM15 registers.
+/// CR4 bit flags for FXSAVE64/FXRSTOR64, SSE/SSE2 XMM registers, and XSAVE/AVX.
 const CR4_OSFXSR: u64 = 1 << 9; // OS support for FXSAVE/FXRSTOR and SSE XMM registers
 const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS support for unmasked SIMD floating-point exceptions
+const CR4_OSXSAVE: u64 = 1 << 18; // OS support for XSAVE and Extended Control Register (XCR0)
 
 /// Default architectural `MXCSR` control/status value (`0x1F80`):
 /// All 6 SIMD floating-point exceptions masked (IM, DM, ZM, OM, UM, PM = bits 7..12),
@@ -57,7 +58,7 @@ impl FpuState {
         }
         let ptr = self.0.as_mut_ptr();
         // SAFETY: `self` is 16-byte aligned (`#[repr(C, align(16))]`), 512 bytes wide,
-        // and `CR4.OSFXSR` was enabled by `fpu::init()`.
+        // and `CR4.OSFXSR` was enabled by `fpu::init_core()`.
         unsafe {
             core::arch::asm!(
                 "fxsave64 [{}]",
@@ -99,35 +100,46 @@ impl Default for FpuState {
     }
 }
 
-/// Enables hardware x87 FPU and SIMD SSE/SSE2 instructions (`XMM0..XMM15`, `FXSAVE64`/`FXRSTOR64`)
-/// for both Ring 0 and Ring 3:
-/// 1. `CR0`: clears `EM` (bit 2) and `TS` (bit 3), sets `MP` (bit 1) and `NE` (bit 5).
-/// 2. `CR4`: sets `OSFXSR` (bit 9) and `OSXMMEXCPT` (bit 10).
-/// 3. Executes `fninit` and loads `MXCSR = 0x1F80` via `ldmxcsr`.
-pub fn init() {
-    if FPU_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    let cr0_after: u64;
-    let cr4_after: u64;
+/// Initializes hardware FPU, SSE/SSE2, and XSAVE/AVX (if supported) on the calling CPU core.
+/// MUST be called on both the Bootstrap Processor (BSP) and every Application Processor (AP).
+pub fn init_core() {
+    let mut cr0: u64;
+    let mut cr4: u64;
     let mxcsr_default: u32 = DEFAULT_MXCSR;
 
-    // SAFETY: Configuring architectural CR0/CR4 FPU/SSE control bits, initializing x87 via
+    // SAFETY: Configuring architectural CR0/CR4 FPU/SSE/XSAVE control bits, initializing x87 via
     // `fninit`, and masking default SIMD exceptions via `ldmxcsr` in Ring 0.
     unsafe {
-        let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
         cr0 &= !(CR0_EM | CR0_TS);
         cr0 |= CR0_MP | CR0_NE;
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
-        cr0_after = cr0;
 
-        let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
         cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+
+        // Query CPUID Leaf 1 for XSAVE and AVX support
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        let has_xsave = (leaf1.ecx & (1 << 26)) != 0;
+        let has_avx = (leaf1.ecx & (1 << 28)) != 0;
+
+        if has_xsave {
+            cr4 |= CR4_OSXSAVE;
+        }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
-        cr4_after = cr4;
+
+        if has_xsave {
+            let xcr0_val: u64 = if has_avx { 0x7 } else { 0x3 };
+            let eax = (xcr0_val & 0xFFFF_FFFF) as u32;
+            let edx = (xcr0_val >> 32) as u32;
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") eax,
+                in("edx") edx,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
 
         let mxcsr_ptr = &raw const mxcsr_default;
         core::arch::asm!(
@@ -137,17 +149,42 @@ pub fn init() {
             options(nostack, preserves_flags)
         );
     }
+}
+
+/// Enables hardware x87 FPU and SIMD SSE/SSE2 instructions (`XMM0..XMM15`, `FXSAVE64`/`FXRSTOR64`)
+/// and XSAVE/AVX on the Bootstrap Processor (BSP).
+pub fn init() {
+    if FPU_INITIALIZED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    init_core();
+
+    let mut cr0: u64;
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    let has_xsave = (leaf1.ecx & (1 << 26)) != 0;
+    let has_avx = (leaf1.ecx & (1 << 28)) != 0;
 
     crate::early_println!(
-        "[ostd::arch::fpu] FPU x87 + SSE/SSE2 activos (CR0={:#x}, CR4={:#x}, MXCSR={:#x}, FXSAVE64=512B)",
-        cr0_after,
-        cr4_after,
-        mxcsr_default
+        "[ostd::arch::fpu] FPU x87 + SSE/SSE2 activos (CR0={:#x}, CR4={:#x}, MXCSR={:#x}, XSAVE={}, AVX={})",
+        cr0,
+        cr4,
+        DEFAULT_MXCSR,
+        has_xsave,
+        has_avx
     );
     crate::fb_println!(
-        "[ostd::arch::fpu] FPU x87 + SSE/SSE2 activos (CR0={:#x}, CR4={:#x}, MXCSR={:#x}, FXSAVE64=512B)",
-        cr0_after,
-        cr4_after,
-        mxcsr_default
+        "[ostd::arch::fpu] FPU x87 + SSE/SSE2 activos (CR0={:#x}, CR4={:#x}, MXCSR={:#x}, XSAVE={}, AVX={})",
+        cr0,
+        cr4,
+        DEFAULT_MXCSR,
+        has_xsave,
+        has_avx
     );
 }

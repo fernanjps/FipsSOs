@@ -49,6 +49,40 @@ pub struct LoadedElf64 {
 pub struct Elf64Loader;
 
 impl Elf64Loader {
+    /// Validates the ELF64 header fields without allocating memory or modifying CR3.
+    pub fn validate_header(elf_bytes: &[u8]) -> Result<(), ElfError> {
+        if elf_bytes.len() < ELF64_EHDR_SIZE {
+            return Err(ElfError::BufferTooSmall);
+        }
+
+        if elf_bytes[0..4] != ELF_MAGIC {
+            return Err(ElfError::InvalidMagic);
+        }
+
+        let ei_class = elf_bytes[4];
+        let ei_data = elf_bytes[5];
+        if ei_class != ELFCLASS64 || ei_data != ELFDATA2LSB {
+            return Err(ElfError::UnsupportedClassOrEndian);
+        }
+
+        let e_type = read_u16_le(elf_bytes, 16)?;
+        if e_type != ET_EXEC && e_type != ET_DYN {
+            return Err(ElfError::UnsupportedType(e_type));
+        }
+
+        let e_machine = read_u16_le(elf_bytes, 18)?;
+        if e_machine != EM_X86_64 {
+            return Err(ElfError::UnsupportedMachine(e_machine));
+        }
+
+        let e_phnum = read_u16_le(elf_bytes, 56)?;
+        if e_phnum == 0 {
+            return Err(ElfError::NoLoadableSegments);
+        }
+
+        Ok(())
+    }
+
     /// Parses an ELF64 binary image from `elf_bytes` and maps all `PT_LOAD` segments
     /// into Lower-Half User Space via `ostd::mm`.
     pub fn load(elf_bytes: &[u8], pie_base_offset: VirtAddr) -> Result<LoadedElf64, ElfError> {

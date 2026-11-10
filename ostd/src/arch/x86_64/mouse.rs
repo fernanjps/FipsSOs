@@ -212,7 +212,6 @@ pub fn init() {
     }
 
     let snap = MOUSE.lock().snapshot();
-    crate::fb_console::draw_mouse_cursor_overlay(snap.x as usize, snap.y as usize, snap.buttons);
 
     crate::early_println!(
         "[ostd::arch::mouse] Raton PS/2 IRQ12 (vec=0x2c) activo | Compaq={:#04x}, ACK={:#04x}/{:#04x} | Pos=({}, {})",
@@ -230,7 +229,8 @@ pub fn init() {
     );
 }
 
-/// Feeds a raw auxiliary PS/2 byte into the 3-byte mouse state machine and refreshes the framebuffer cursor.
+/// Feeds a raw auxiliary PS/2 byte into the 3-byte mouse state machine and updates coordinates.
+/// In text TTY console mode, does not repaint pixel overlays on VRAM to prevent bus contention with typing.
 pub(crate) fn process_packet_byte(byte: u8) {
     let committed = if let Some(mut guard) = MOUSE.try_lock() {
         guard.feed_byte(byte)
@@ -239,7 +239,9 @@ pub(crate) fn process_packet_byte(byte: u8) {
     };
 
     if let Some((x, y, buttons)) = committed {
-        crate::fb_console::draw_mouse_cursor_overlay(x, y, buttons);
+        if crate::fb_console::is_desktop_mode() {
+            crate::fb_console::draw_mouse_cursor_overlay(x, y, buttons);
+        }
     }
 }
 
@@ -249,15 +251,13 @@ pub(crate) fn on_irq12() {
     unsafe {
         for _ in 0..6 {
             let status = inb(PS2_STATUS_CMD_PORT);
-            if (status & STATUS_OUTPUT_FULL) == 0 {
+            if (status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
+                != (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
+            {
                 break;
             }
             let data = inb(PS2_DATA_PORT);
-            if (status & STATUS_AUX_DATA) != 0 {
-                process_packet_byte(data);
-            } else {
-                super::keyboard::process_scancode_from_aux_poll(data);
-            }
+            process_packet_byte(data);
         }
     }
 }

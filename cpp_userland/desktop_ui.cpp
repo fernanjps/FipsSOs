@@ -2,11 +2,6 @@
 
 namespace {
 
-constexpr int kScreenW  = 1280;
-constexpr int kScreenH  = 800;
-constexpr int kTaskbarH = 48;
-constexpr int kTaskbarY = kScreenH - kTaskbarH; // 752
-
 constexpr int kSphereSize = 132;
 
 constexpr float kPi     = 3.14159265f;
@@ -227,6 +222,12 @@ struct FloatingWindow {
 /// Compact Ring 3 static state (`< 78 KiB` total `.bss`, zero heap allocations).
 struct CompositorState {
     uint32_t* backbuf;
+    int       screen_w;
+    int       screen_h;
+    int       fb_pitch;
+    int       bpp;
+    int       taskbar_h;
+    int       taskbar_y;
     int64_t   fb_fd;
     int64_t   mouse_fd;
     int64_t   net_fd;
@@ -236,13 +237,15 @@ struct CompositorState {
 
     Rect clip;
 
-    // 1D Aurora Wallpaper LUTs (6.2 KiB total instead of a 4 MiB wallpaper bitmap!)
-    uint8_t bg_xr[kScreenW];
-    uint8_t bg_xg[kScreenW];
-    uint8_t bg_xb[kScreenW];
-    uint8_t bg_yr[kScreenH];
-    uint8_t bg_yg[kScreenH];
-    uint8_t bg_yb[kScreenH];
+    // 1D Aurora Wallpaper LUTs (supports dynamically up to 2560x1600 display modes)
+    static constexpr int kMaxW = 2560;
+    static constexpr int kMaxH = 1600;
+    uint8_t bg_xr[kMaxW];
+    uint8_t bg_xg[kMaxW];
+    uint8_t bg_xb[kMaxW];
+    uint8_t bg_yr[kMaxH];
+    uint8_t bg_yg[kMaxH];
+    uint8_t bg_yb[kMaxH];
 
     // Cached 132x132 3D Phong sphere tile (recomputed only when 3D camera/light changes)
     uint32_t sphere_tile[kSphereSize * kSphereSize];
@@ -287,6 +290,12 @@ struct CompositorState {
     char     browser_status[48];
     char     browser_downloaded_body[256];
     int      selected_disk_file;
+
+    // FASE v2.4: App Center & Network Software Manager
+    int      appcenter_selected; // 0 = sample_tool.elf, 1 = benchmark_simd.elf, 2 = editor_kilo.elf
+    bool     appcenter_installed[3];
+    char     appcenter_console[128];
+    char     appcenter_last_exec[64];
 };
 
 CompositorState g_ui;
@@ -390,22 +399,26 @@ inline uint32_t blend_rgb(uint32_t dst, uint32_t src, uint32_t alpha) noexcept {
 }
 
 inline void put_px(int x, int y, uint32_t rgb) noexcept {
-    if (x >= g_ui.clip.x && x < (g_ui.clip.x + g_ui.clip.w) &&
+    if (x >= 0 && x < g_ui.screen_w &&
+        y >= 0 && y < g_ui.screen_h &&
+        x >= g_ui.clip.x && x < (g_ui.clip.x + g_ui.clip.w) &&
         y >= g_ui.clip.y && y < (g_ui.clip.y + g_ui.clip.h)) {
-        g_ui.backbuf[y * kScreenW + x] = rgb;
+        const int pitch_pixels = g_ui.fb_pitch / 4;
+        g_ui.backbuf[y * pitch_pixels + x] = rgb;
     }
 }
 
 void fill_rect(int x, int y, int w, int h, uint32_t rgb) noexcept {
-    const int x0 = max_i(x, g_ui.clip.x);
-    const int y0 = max_i(y, g_ui.clip.y);
-    const int x1 = min_i(x + w, g_ui.clip.x + g_ui.clip.w);
-    const int y1 = min_i(y + h, g_ui.clip.y + g_ui.clip.h);
+    const int x0 = max_i(max_i(x, g_ui.clip.x), 0);
+    const int y0 = max_i(max_i(y, g_ui.clip.y), 0);
+    const int x1 = min_i(min_i(x + w, g_ui.clip.x + g_ui.clip.w), g_ui.screen_w);
+    const int y1 = min_i(min_i(y + h, g_ui.clip.y + g_ui.clip.h), g_ui.screen_h);
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
+    const int pitch_pixels = g_ui.fb_pitch / 4;
     for (int py = y0; py < y1; ++py) {
-        uint32_t* row = g_ui.backbuf + py * kScreenW;
+        uint32_t* row = g_ui.backbuf + py * pitch_pixels;
         for (int px = x0; px < x1; ++px) {
             row[px] = rgb;
         }
@@ -413,15 +426,16 @@ void fill_rect(int x, int y, int w, int h, uint32_t rgb) noexcept {
 }
 
 void blend_rect(int x, int y, int w, int h, uint32_t rgb, uint32_t alpha_256) noexcept {
-    const int x0 = max_i(x, g_ui.clip.x);
-    const int y0 = max_i(y, g_ui.clip.y);
-    const int x1 = min_i(x + w, g_ui.clip.x + g_ui.clip.w);
-    const int y1 = min_i(y + h, g_ui.clip.y + g_ui.clip.h);
+    const int x0 = max_i(max_i(x, g_ui.clip.x), 0);
+    const int y0 = max_i(max_i(y, g_ui.clip.y), 0);
+    const int x1 = min_i(min_i(x + w, g_ui.clip.x + g_ui.clip.w), g_ui.screen_w);
+    const int y1 = min_i(min_i(y + h, g_ui.clip.y + g_ui.clip.h), g_ui.screen_h);
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
+    const int pitch_pixels = g_ui.fb_pitch / 4;
     for (int py = y0; py < y1; ++py) {
-        uint32_t* row = g_ui.backbuf + py * kScreenW;
+        uint32_t* row = g_ui.backbuf + py * pitch_pixels;
         for (int px = x0; px < x1; ++px) {
             row[px] = blend_rgb(row[px], rgb, alpha_256);
         }
@@ -448,6 +462,7 @@ void fill_round_rect(int x, int y, int w, int h, int r, uint32_t rgb) noexcept {
     }
     const int y0 = max_i(y, g_ui.clip.y);
     const int y1 = min_i(y + h, g_ui.clip.y + g_ui.clip.h);
+    const int pitch_pixels = g_ui.fb_pitch / 4;
     for (int py = y0; py < y1; ++py) {
         const int top_d = py - y;
         const int bot_d = (y + h - 1) - py;
@@ -456,7 +471,7 @@ void fill_round_rect(int x, int y, int w, int h, int r, uint32_t rgb) noexcept {
         const int x0     = max_i(x + inset, g_ui.clip.x);
         const int x1     = min_i(x + w - inset, g_ui.clip.x + g_ui.clip.w);
         if (x0 < x1) {
-            uint32_t* row = g_ui.backbuf + py * kScreenW;
+            uint32_t* row = g_ui.backbuf + py * pitch_pixels;
             for (int px = x0; px < x1; ++px) {
                 row[px] = rgb;
             }
@@ -470,6 +485,7 @@ void blend_round_rect(int x, int y, int w, int h, int r, uint32_t rgb, uint32_t 
     }
     const int y0 = max_i(y, g_ui.clip.y);
     const int y1 = min_i(y + h, g_ui.clip.y + g_ui.clip.h);
+    const int pitch_pixels = g_ui.fb_pitch / 4;
     for (int py = y0; py < y1; ++py) {
         const int top_d  = py - y;
         const int bot_d  = (y + h - 1) - py;
@@ -478,7 +494,7 @@ void blend_round_rect(int x, int y, int w, int h, int r, uint32_t rgb, uint32_t 
         const int x0     = max_i(x + inset, g_ui.clip.x);
         const int x1     = min_i(x + w - inset, g_ui.clip.x + g_ui.clip.w);
         if (x0 < x1) {
-            uint32_t* row = g_ui.backbuf + py * kScreenW;
+            uint32_t* row = g_ui.backbuf + py * pitch_pixels;
             for (int px = x0; px < x1; ++px) {
                 row[px] = blend_rgb(row[px], rgb, alpha_256);
             }
@@ -514,8 +530,11 @@ void draw_shadow(int x, int y, int w, int h) noexcept {
     blend_round_rect(x + 2, y + 3, w, h, 8, 0x00050C, 80);
 }
 
-void draw_char(char ch, int x, int y, uint32_t fg) noexcept {
-    if (x + 8 <= g_ui.clip.x || x >= g_ui.clip.x + g_ui.clip.w ||
+void draw_char(char ch, int x, int y, uint32_t fg, int max_x = 0x7FFFFFFF) noexcept {
+    const int limit_x = min_i(max_x, g_ui.screen_w - 8);
+    if (x < 0 || x > limit_x ||
+        x + 8 <= g_ui.clip.x || x >= g_ui.clip.x + g_ui.clip.w ||
+        y < 0 || y + 8 > g_ui.screen_h ||
         y + 8 <= g_ui.clip.y || y >= g_ui.clip.y + g_ui.clip.h) {
         return;
     }
@@ -535,10 +554,14 @@ void draw_char(char ch, int x, int y, uint32_t fg) noexcept {
     }
 }
 
-void draw_text(const char* s, int x, int y, uint32_t fg) noexcept {
+void draw_text(const char* s, int x, int y, uint32_t fg, int max_x = 0x7FFFFFFF) noexcept {
+    const int limit_x = min_i(max_x, g_ui.screen_w - 8);
     int cx = x;
     while (*s != '\0') {
-        draw_char(*s, cx, y, fg);
+        if (cx > limit_x) {
+            break;
+        }
+        draw_char(*s, cx, y, fg, limit_x);
         cx += 8;
         ++s;
     }
@@ -607,16 +630,18 @@ void draw_icon_tty(int x, int y) noexcept {
 // --- Wallpaper LUT & 3D SSE2 Sphere Generator ---
 
 void init_wallpaper_luts() noexcept {
-    for (int x = 0; x < kScreenW; ++x) {
-        const float fx    = static_cast<float>(x) * (1.0f / static_cast<float>(kScreenW));
+    const int w = (g_ui.screen_w > 0 && g_ui.screen_w <= CompositorState::kMaxW) ? g_ui.screen_w : 1024;
+    const int h = (g_ui.screen_h > 0 && g_ui.screen_h <= CompositorState::kMaxH) ? g_ui.screen_h : 768;
+    for (int x = 0; x < w; ++x) {
+        const float fx    = static_cast<float>(x) * (1.0f / static_cast<float>(w));
         const float bloom = sinf_fast((fx - 0.15f) * kPi);
         const float bpos  = (bloom > 0.0f) ? bloom : 0.0f;
         g_ui.bg_xr[x]     = static_cast<uint8_t>(6.0f + bpos * 18.0f);
         g_ui.bg_xg[x]     = static_cast<uint8_t>(14.0f + bpos * 44.0f);
         g_ui.bg_xb[x]     = static_cast<uint8_t>(30.0f + bpos * 72.0f);
     }
-    for (int y = 0; y < kScreenH; ++y) {
-        const float fy   = static_cast<float>(y) * (1.0f / static_cast<float>(kScreenH));
+    for (int y = 0; y < h; ++y) {
+        const float fy   = static_cast<float>(y) * (1.0f / static_cast<float>(h));
         const float wave = sinf_fast((1.0f - fy) * 2.2f);
         const float wpos = (wave > 0.0f) ? wave : 0.0f;
         g_ui.bg_yr[y]    = static_cast<uint8_t>(4.0f + fy * 10.0f + wpos * 8.0f);
@@ -628,14 +653,15 @@ void init_wallpaper_luts() noexcept {
 void render_wallpaper_clipped() noexcept {
     const int x0 = max_i(0, g_ui.clip.x);
     const int y0 = max_i(0, g_ui.clip.y);
-    const int x1 = min_i(kScreenW, g_ui.clip.x + g_ui.clip.w);
-    const int y1 = min_i(kScreenH, g_ui.clip.y + g_ui.clip.h);
+    const int x1 = min_i(g_ui.screen_w, g_ui.clip.x + g_ui.clip.w);
+    const int y1 = min_i(g_ui.screen_h, g_ui.clip.y + g_ui.clip.h);
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
 
+    const int pitch_pixels = g_ui.fb_pitch / 4;
     for (int y = y0; y < y1; ++y) {
-        uint32_t*      row = g_ui.backbuf + y * kScreenW;
+        uint32_t*      row = g_ui.backbuf + y * pitch_pixels;
         const uint32_t yr  = g_ui.bg_yr[y];
         const uint32_t yg  = g_ui.bg_yg[y];
         const uint32_t yb  = g_ui.bg_yb[y];
@@ -818,7 +844,6 @@ void action_save_disk() noexcept {
 void action_spawn_bg_task() noexcept {
     if (g_ui.fb_fd >= 0) {
         fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::VFS_IOCTL_TASK_CONTROL, 1ULL);
-        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (1200U << 16) | 50U);
         push_spark_sample(36);
         set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Task Manager: bg_downloader PID 1051 iniciado");
     }
@@ -832,23 +857,18 @@ void action_kill_task() noexcept {
             set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Task Manager: bg_downloader PID 1051 terminado");
         } else {
             fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::VFS_IOCTL_TASK_CONTROL, 3ULL);
-            set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Task Manager: npu-telemetryd terminado (SIGKILL)");
+            set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Task Manager: simd-worker terminado (SIGKILL)");
         }
-        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (440U << 16) | 60U);
         push_spark_sample(20);
     }
     refresh_kernel_telemetry();
 }
 
-void action_toggle_wifi() noexcept {
-    if (g_ui.fb_fd >= 0) {
-        const uint64_t target = (g_ui.sys_tel.wifi_active_iface == 0) ? 1ULL : 0ULL;
-        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::WIFI_IOCTL_STATUS, target);
-        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (900U << 16) | 30U);
-        push_spark_sample(28);
-        set_cstr(g_ui.last_action, sizeof(g_ui.last_action), (target == 1) ? "Red: Interfaz cambiada a wlan0 (WiFi)" : "Red: Interfaz cambiada a eth0 (PCIe)");
-    }
+void action_refresh_net() noexcept {
+    action_ping_gateway(false);
     refresh_kernel_telemetry();
+    push_spark_sample(28);
+    set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Red PCIe eth0: Telemetria refrescada (Link UP 1000 Mbps)");
 }
 
 void action_browser_get() noexcept {
@@ -947,9 +967,6 @@ void action_browser_get() noexcept {
     }
 
     push_spark_sample(46);
-    if (g_ui.fb_fd >= 0) {
-        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (1400U << 16) | 40U);
-    }
 
     size_t p = 0;
     p = fmt_str(g_ui.fmt, p, "TCP Socket: ");
@@ -977,14 +994,12 @@ void action_cycle_bookmark() noexcept {
         set_cstr(g_ui.browser_url, sizeof(g_ui.browser_url), "http://10.0.2.2:8080/ai_model_v2.bin");
     }
     set_cstr(g_ui.browser_status, sizeof(g_ui.browser_status), "Listo para GET TCP");
-    fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (1100U << 16) | 20U);
 }
 
 void action_delete_sata_file() noexcept {
     const char* path_to_del = (g_ui.selected_disk_file == 0) ? "/disk/persistent_note.txt" : "/disk/index.html";
     g_ui.selected_disk_file = (g_ui.selected_disk_file + 1) % 2;
     fipsos::sys_unlink(path_to_del);
-    fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::AUDIO_IOCTL_BEEP, (500U << 16) | 80U);
     push_spark_sample(16);
     size_t p = 0;
     p = fmt_str(g_ui.fmt, p, "SATA: ");
@@ -996,6 +1011,152 @@ void action_delete_sata_file() noexcept {
 
 void flip_full() noexcept;
 void compose_all_to_backbuf() noexcept;
+
+struct AppCenterItem {
+    const char* name;
+    const char* desc;
+    const char* url_path;
+    const char* dest_path;
+};
+
+static const AppCenterItem kAppCenterItems[3] = {
+    { "sample_tool.elf",   "Diagnostico del sistema y llamadas POSIX", "/sample_tool.elf",   "/disk/bin/sample_tool.elf" },
+    { "benchmark_simd.elf", "Calculo vectorial FP32 SSE2 (128 bits)",   "/benchmark_simd.elf", "/disk/bin/benchmark_simd.elf" },
+    { "editor_kilo.elf",    "Editor de texto modal en consola TTY",    "/editor_kilo.elf",    "/disk/bin/editor_kilo.elf" },
+};
+
+void action_appcenter_cycle() noexcept {
+    g_ui.appcenter_selected = (g_ui.appcenter_selected + 1) % 3;
+    size_t cp = 0;
+    cp = fmt_str(g_ui.appcenter_console, cp, "Seleccionado: ");
+    cp = fmt_str(g_ui.appcenter_console, cp, kAppCenterItems[g_ui.appcenter_selected].name);
+    set_cstr(g_ui.last_action, sizeof(g_ui.last_action), g_ui.appcenter_console);
+    refresh_kernel_telemetry();
+}
+
+void action_launch_elf(const char* elf_path, const char* label) noexcept;
+
+void action_appcenter_launch() noexcept {
+    const int idx = g_ui.appcenter_selected;
+    if (idx < 0 || idx >= 3) return;
+    const AppCenterItem& app = kAppCenterItems[idx];
+
+    size_t cp = 0;
+    cp = fmt_str(g_ui.appcenter_console, cp, "[Lanzando] ");
+    cp = fmt_str(g_ui.appcenter_console, cp, app.dest_path);
+    cp = fmt_str(g_ui.appcenter_console, cp, " via sys_execve...");
+    set_cstr(g_ui.last_action, sizeof(g_ui.last_action), g_ui.appcenter_console);
+    set_cstr(g_ui.appcenter_last_exec, sizeof(g_ui.appcenter_last_exec), app.name);
+
+    push_spark_sample(40);
+    refresh_kernel_telemetry();
+
+    action_launch_elf(app.dest_path, app.name);
+
+    cp = 0;
+    cp = fmt_str(g_ui.appcenter_console, cp, "[Ejecutado] ");
+    cp = fmt_str(g_ui.appcenter_console, cp, app.name);
+    cp = fmt_str(g_ui.appcenter_console, cp, " finalizo correctamente");
+    set_cstr(g_ui.last_action, sizeof(g_ui.last_action), g_ui.appcenter_console);
+    refresh_kernel_telemetry();
+}
+
+void action_appcenter_install() noexcept {
+    const int idx = g_ui.appcenter_selected;
+    if (idx < 0 || idx >= 3) return;
+    const AppCenterItem& app = kAppCenterItems[idx];
+
+    // 1. Crear socket POSIX
+    const int64_t sock_fd = fipsos::sys_socket(fipsos::AF_INET, fipsos::SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        set_cstr(g_ui.appcenter_console, sizeof(g_ui.appcenter_console), "Error: socket() fallo");
+        set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "AppCenter: socket() error");
+        refresh_kernel_telemetry();
+        return;
+    }
+
+    // 2. Conectar al host 10.0.2.2:8080
+    fipsos::SockAddrIn server_addr{};
+    server_addr.sin_family = fipsos::AF_INET;
+    server_addr.sin_port = static_cast<uint16_t>(((8080U & 0xFFU) << 8) | ((8080U >> 8) & 0xFFU));
+    const uint8_t ip[4] = {10, 0, 2, 2};
+    for (size_t i = 0; i < 4; ++i) {
+        reinterpret_cast<uint8_t*>(&server_addr.sin_addr.s_addr)[i] = ip[i];
+    }
+
+    if (fipsos::sys_connect(sock_fd, &server_addr, sizeof(server_addr)) < 0) {
+        fipsos::sys_close(static_cast<uint64_t>(sock_fd));
+        set_cstr(g_ui.appcenter_console, sizeof(g_ui.appcenter_console), "Error: Host 10.0.2.2:8080 inalcanzable");
+        set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "AppCenter: Error conexion TCP");
+        refresh_kernel_telemetry();
+        return;
+    }
+
+    // 3. Peticion HTTP GET
+    char req_buf[256];
+    size_t req_len = 0;
+    req_len = fmt_str(req_buf, req_len, "GET ");
+    req_len = fmt_str(req_buf, req_len, app.url_path);
+    req_len = fmt_str(req_buf, req_len, " HTTP/1.0\r\nHost: 10.0.2.2:8080\r\nUser-Agent: FipSOs-AppCenter/2.4\r\nConnection: close\r\n\r\n");
+    fipsos::sys_sendto(sock_fd, req_buf, req_len, 0);
+
+    // 4. Abrir archivo de destino en /disk/bin/<app>
+    const int64_t disk_fd = fipsos::sys_open(app.dest_path, fipsos::O_CREAT | fipsos::O_RDWR);
+    if (disk_fd < 0) {
+        fipsos::sys_close(static_cast<uint64_t>(sock_fd));
+        set_cstr(g_ui.appcenter_console, sizeof(g_ui.appcenter_console), "Error: No se pudo crear en /disk/bin/");
+        set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "AppCenter: Error abrir archivo");
+        refresh_kernel_telemetry();
+        return;
+    }
+
+    // 5. Descargar datos y escribir a SATA DiskFS
+    char recv_buf[2048];
+    int64_t n = fipsos::sys_recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0);
+    size_t total_written = 0;
+    if (n > 0) {
+        const char* body = recv_buf;
+        size_t body_len = static_cast<size_t>(n);
+        for (size_t i = 0; i + 3 < static_cast<size_t>(n); ++i) {
+            if (recv_buf[i] == '\r' && recv_buf[i+1] == '\n' && recv_buf[i+2] == '\r' && recv_buf[i+3] == '\n') {
+                body = recv_buf + i + 4;
+                body_len = static_cast<size_t>(n) - (i + 4);
+                break;
+            }
+        }
+        if (body_len > 0) {
+            fipsos::sys_write(static_cast<uint64_t>(disk_fd), body, body_len);
+            total_written += body_len;
+        }
+    }
+
+    while (true) {
+        n = fipsos::sys_recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0);
+        if (n <= 0) break;
+        fipsos::sys_write(static_cast<uint64_t>(disk_fd), recv_buf, static_cast<size_t>(n));
+        total_written += static_cast<size_t>(n);
+    }
+
+    fipsos::sys_close(static_cast<uint64_t>(disk_fd));
+    fipsos::sys_close(static_cast<uint64_t>(sock_fd));
+
+    // Sincronizar persistentemente a disco SATA AHCI
+    if (g_ui.fb_fd >= 0) {
+        fipsos::sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), fipsos::DISK_IOCTL_SAVE_NOTE, 0ULL);
+    }
+
+    g_ui.appcenter_installed[idx] = true;
+    size_t cp = 0;
+    cp = fmt_str(g_ui.appcenter_console, cp, "[TCP OK] ");
+    cp = fmt_str(g_ui.appcenter_console, cp, app.name);
+    cp = fmt_str(g_ui.appcenter_console, cp, " (");
+    cp = fmt_u32(g_ui.appcenter_console, cp, static_cast<uint32_t>(total_written));
+    cp = fmt_str(g_ui.appcenter_console, cp, " B en /disk/bin/)");
+
+    set_cstr(g_ui.last_action, sizeof(g_ui.last_action), g_ui.appcenter_console);
+    push_spark_sample(48);
+    refresh_kernel_telemetry();
+}
 
 void action_launch_elf(const char* elf_path, const char* label) noexcept {
     g_ui.start_open = false;
@@ -1023,20 +1184,22 @@ void action_launch_elf(const char* elf_path, const char* label) noexcept {
 
 void draw_desktop_shortcuts() noexcept {
     // Top-right Zero-Bloat + Hardware CR3 Status Pill
-    blend_round_rect(892, 12, 372, 30, 6, 0x0B1628, 204);
-    stroke_round_rect(892, 12, 372, 30, 6, 0x26466D);
+    const int pill_w = 372;
+    const int pill_x = g_ui.screen_w - pill_w - 16;
+    blend_round_rect(pill_x, 12, pill_w, 30, 6, 0x0B1628, 204);
+    stroke_round_rect(pill_x, 12, pill_w, 30, 6, 0x26466D);
 
     const uint32_t used_mib  = g_ui.sys_tel.ram_used_kib / 1024U;
     const uint32_t total_mib = (g_ui.sys_tel.ram_total_kib > 0U) ? (g_ui.sys_tel.ram_total_kib / 1024U) : 504U;
     size_t p = 0;
-    p = fmt_str(g_ui.fmt, p, "FipSOs v1.8 | CR3 ");
+    p = fmt_str(g_ui.fmt, p, "FipSOs v3.1 | CR3 ");
     p = fmt_hex_u64(g_ui.fmt, p, g_ui.sys_tel.active_cr3);
     p = fmt_str(g_ui.fmt, p, " | ");
     p = fmt_u32(g_ui.fmt, p, used_mib);
     p = fmt_str(g_ui.fmt, p, "/");
     p = fmt_u32(g_ui.fmt, p, total_mib);
     p = fmt_str(g_ui.fmt, p, "M");
-    draw_text(g_ui.fmt, 906, 23, 0x7AE582);
+    draw_text(g_ui.fmt, pill_x + 14, 23, 0x7AE582);
 
     // 4 Left Desktop Shortcut Tiles
     struct Shortcut {
@@ -1046,7 +1209,7 @@ void draw_desktop_shortcuts() noexcept {
     };
     constexpr Shortcut kShortcuts[4] = {
         {20,  "Mi FipSOs", 2},
-        {108, "Red & NPU", 0},
+        {108, "Red & SIMD", 0},
         {196, "Esfera 3D", 1},
         {284, "App Rust",  3},
     };
@@ -1109,37 +1272,38 @@ void draw_win_monitor(const FloatingWindow& w, bool focused) noexcept {
     draw_window_chrome(w, focused);
     const int cx = w.x + 14;
     const int cy = w.y + 42;
+    const int clip_r = w.x + w.w - 14;
 
     // Card 1: Procesos Round-Robin SMP Cores 0 & 1
     fill_round_rect(cx, cy, w.w - 28, 96, 6, 0x091220);
     stroke_round_rect(cx, cy, w.w - 28, 96, 6, 0x1E3A5F);
-    draw_text("Planificacion Distribuida SMP (Cores Concurrentes 0 y 1):", cx + 10, cy + 8, 0x38BDF8);
+    draw_text("Planificacion Distribuida SMP (Cores 0 y 1):", cx + 10, cy + 8, 0x38BDF8, clip_r);
 
     size_t p = 0;
-    p = fmt_str(g_ui.fmt, p, "[CPU0] Core 0 (BSP): Foreground | desktop_ui.elf PID 1041 (CR3=");
+    p = fmt_str(g_ui.fmt, p, "[CPU0] BSP: desktop_ui.elf (CR3=");
     p = fmt_hex_u64(g_ui.fmt, p, g_ui.sys_tel.active_cr3);
     p = fmt_str(g_ui.fmt, p, ")");
-    draw_text(g_ui.fmt, cx + 10, cy + 24, 0x93C5FD);
+    draw_text(g_ui.fmt, cx + 10, cy + 24, 0x93C5FD, clip_r);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "[CPU1] Core 1 (AP) : Worker     | ");
+    p = fmt_str(g_ui.fmt, p, "[CPU1] AP : ");
     if (g_ui.sys_tel.bg_task_state == 1) {
         p = fmt_str(g_ui.fmt, p, "bg_downloader PID 1051 (Activo DMA)");
     } else if (g_ui.sys_tel.bg_task_state == 2) {
-        p = fmt_str(g_ui.fmt, p, "npu-telemetryd Detenido (SIGKILL 9)");
+        p = fmt_str(g_ui.fmt, p, "simd-worker Detenido (SIGKILL 9)");
     } else {
-        p = fmt_str(g_ui.fmt, p, "npu-telemetryd PID 1035 (Activo CPL=0)");
+        p = fmt_str(g_ui.fmt, p, "simd-worker PID 1035 (Activo CPL=0)");
     }
-    draw_text(g_ui.fmt, cx + 10, cy + 40, (g_ui.sys_tel.bg_task_state == 2) ? 0xF87171 : 0x00F5D4);
+    draw_text(g_ui.fmt, cx + 10, cy + 40, (g_ui.sys_tel.bg_task_state == 2) ? 0xF87171 : 0x00F5D4, clip_r);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "[TAREAS] Shell PID 1033 | NPU Infer PID 1037 | C++20 Avatar PID 1039");
-    draw_text(g_ui.fmt, cx + 10, cy + 56, 0xE2E8F0);
+    p = fmt_str(g_ui.fmt, p, "[TAREAS] Shell PID 1033 | SIMD PID 1037 | UI PID 1041");
+    draw_text(g_ui.fmt, cx + 10, cy + 56, 0xE2E8F0, clip_r);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "[BGT] PID 1051 | bg_downloader    | ");
-    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.bg_task_state == 1) ? "Activo (Descargas DMA Core 1)" : "Inactivo / Detenido");
-    draw_text(g_ui.fmt, cx + 10, cy + 72, (g_ui.sys_tel.bg_task_state == 1) ? 0x4ADE80 : 0x94A3B8);
+    p = fmt_str(g_ui.fmt, p, "[BGT] PID 1051 | bg_downloader | ");
+    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.bg_task_state == 1) ? "Activo (DMA Core 1)" : "Inactivo / Detenido");
+    draw_text(g_ui.fmt, cx + 10, cy + 72, (g_ui.sys_tel.bg_task_state == 1) ? 0x4ADE80 : 0x94A3B8, clip_r);
 
     // Card 2: Hardware Sensors (CPU MHz, Temp, Cores/Threads, Fault Recovery)
     const int c2_y = cy + 102;
@@ -1149,14 +1313,18 @@ void draw_win_monitor(const FloatingWindow& w, bool focused) noexcept {
     p = 0;
     p = fmt_str(g_ui.fmt, p, "CPU: ");
     p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.cpu_mhz);
-    p = fmt_str(g_ui.fmt, p, " MHz | Cores SMP: ");
+    p = fmt_str(g_ui.fmt, p, " MHz | Cores: ");
     p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.physical_cores));
     p = fmt_str(g_ui.fmt, p, "C/");
     p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.logical_threads));
-    p = fmt_str(g_ui.fmt, p, "T (Core0+Core1 Online) | Temp: ");
-    p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.temp_celsius);
-    p = fmt_str(g_ui.fmt, p, " C (DTS)");
-    draw_text(g_ui.fmt, cx + 10, c2_y + 8, 0x38BDF8);
+    p = fmt_str(g_ui.fmt, p, "T | Temp: ");
+    if (g_ui.sys_tel.temp_celsius == 0U) {
+        p = fmt_str(g_ui.fmt, p, "N/A (VM Hypervisor)");
+    } else {
+        p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.temp_celsius);
+        p = fmt_str(g_ui.fmt, p, " C (DTS)");
+    }
+    draw_text(g_ui.fmt, cx + 10, c2_y + 8, 0x38BDF8, clip_r);
 
     p = 0;
     p = fmt_str(g_ui.fmt, p, "Recuperacion #PF/#GP: ");
@@ -1165,27 +1333,29 @@ void draw_win_monitor(const FloatingWindow& w, bool focused) noexcept {
     p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.daemon_switches);
     p = fmt_str(g_ui.fmt, p, " | Preemp: ");
     p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.preemptions);
-    draw_text(g_ui.fmt, cx + 10, c2_y + 26, 0x7AE582);
+    draw_text(g_ui.fmt, cx + 10, c2_y + 26, 0x7AE582, clip_r);
 
-    // Card 3: Red Inalambrica WiFi 802.11 & Audio PCM
+    // Card 3: Red PCIe Intel e1000e (eth0 Gigabit Ethernet)
     const int c3_y = c2_y + 54;
     fill_round_rect(cx, c3_y, w.w - 28, 54, 6, 0x091220);
     stroke_round_rect(cx, c3_y, w.w - 28, 54, 6, 0x1E3A5F);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "WiFi 802.11: SSID=\"");
-    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.wifi_ssid[0] != '\0') ? g_ui.sys_tel.wifi_ssid : "FipSOs-5G-Ultra");
-    p = fmt_str(g_ui.fmt, p, "\" | Ch ");
-    p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.wifi_channel));
-    p = fmt_str(g_ui.fmt, p, " | -42 dBm (WPA3)");
-    draw_text(g_ui.fmt, cx + 10, c3_y + 8, 0xFBBF24);
+    p = fmt_str(g_ui.fmt, p, "PCIe NIC: e1000e 00:03.0 | Link: ");
+    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.net_link_up != 0) ? "UP (1 Gbps)" : "DOWN");
+    p = fmt_str(g_ui.fmt, p, " | MAC: ");
+    for (int mi = 0; mi < 6; ++mi) {
+        p = fmt_hex_byte(g_ui.fmt, p, g_ui.sys_tel.mac[mi]);
+        if (mi < 5) p = fmt_str(g_ui.fmt, p, ":");
+    }
+    draw_text(g_ui.fmt, cx + 10, c3_y + 8, (g_ui.sys_tel.net_link_up != 0) ? 0x00F5D4 : 0xEF4444, clip_r);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "Iface: ");
-    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.wifi_active_iface == 1) ? "wlan0 (WiFi)" : "eth0 (PCIe 1Gbps)");
-    p = fmt_str(g_ui.fmt, p, " | Audio: /dev/snd/pcm0 PIT Ch2 | Beeps: ");
-    p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.audio_beeps_count);
-    draw_text(g_ui.fmt, cx + 10, c3_y + 26, (g_ui.sys_tel.wifi_link_up != 0) ? 0x00F5D4 : 0x94A3B8);
+    p = fmt_str(g_ui.fmt, p, "Iface: eth0 (/dev/net/eth0) | TX: ");
+    p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.net_tx_packets);
+    p = fmt_str(g_ui.fmt, p, " | RX: ");
+    p = fmt_u32(g_ui.fmt, p, g_ui.sys_tel.net_rx_packets);
+    draw_text(g_ui.fmt, cx + 10, c3_y + 26, 0x38BDF8, clip_r);
 
     // Card 4: RAM Bar & SATA AHCI
     const int c4_y = c3_y + 60;
@@ -1208,7 +1378,7 @@ void draw_win_monitor(const FloatingWindow& w, bool focused) noexcept {
     p = fmt_str(g_ui.fmt, p, "R/");
     p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.disk_sectors_written));
     p = fmt_str(g_ui.fmt, p, "W");
-    draw_text(g_ui.fmt, cx + 10, c4_y + 8, 0x7AE582);
+    draw_text(g_ui.fmt, cx + 10, c4_y + 8, 0x7AE582, clip_r);
 
     const int bar_w  = w.w - 48;
     const int fill_w = max_i(12, static_cast<int>((static_cast<uint64_t>(bar_w) * used_kib) / total_kib));
@@ -1219,7 +1389,7 @@ void draw_win_monitor(const FloatingWindow& w, bool focused) noexcept {
     const int by = w.y + w.h - 36;
     draw_button(w.x + 14,  by, 145, 26, "Lanzar BG Task", 0x123254, 0x38BDF8, 0xF8FAFC);
     draw_button(w.x + 170, by, 145, 26, "Kill Task/Dmn",  0x4A1520, 0xEF4444, 0xF8FAFC);
-    draw_button(w.x + 326, by, 150, 26, "WiFi wlan0/eth", 0x123B34, 0x10B981, 0xF8FAFC);
+    draw_button(w.x + 326, by, 150, 26, "Refrescar Red",  0x123B34, 0x10B981, 0xF8FAFC);
 }
 
 void draw_win_browser(const FloatingWindow& w, bool focused) noexcept {
@@ -1245,7 +1415,7 @@ void draw_win_browser(const FloatingWindow& w, bool focused) noexcept {
     fill_round_rect(cx, fy, w.w - 28, fh, 6, 0x07111D);
     stroke_round_rect(cx, fy, w.w - 28, fh, 6, 0x1E3A5F);
 
-    draw_text("=== NAVEGADOR WEB / DESCARGAS TCP (FipSOs v2.2) ===", cx + 12, fy + 10, 0x00F5D4);
+    draw_text("=== NAVEGADOR WEB / DESCARGAS TCP (FipSOs v3.1) ===", cx + 12, fy + 10, 0x00F5D4);
     draw_text("URL: http://10.0.2.2:8080/host_test.txt (Acceso Rapido Host WSL2)", cx + 12, fy + 26, 0xFBBF24);
 
     if (g_ui.browser_downloaded_body[0] != '\0') {
@@ -1261,7 +1431,7 @@ void draw_win_browser(const FloatingWindow& w, bool focused) noexcept {
         draw_text("Control de Tareas sys_kill (62) + Borrado en Disco sys_unlink (87)", cx + 12, fy + 112, 0xF472B6);
         draw_text("Ruta guardada en disco: /disk/host_test.txt (SATA AHCI DMA)", cx + 12, fy + 130, 0xCBD5E1);
     } else if (g_ui.browser_bookmark == 2) {
-        draw_text("[HTML] index.html (Portal Oficial FipSOs v2.2 - Arquitectura Abierta)", cx + 12, fy + 48, 0xE2E8F0);
+        draw_text("[HTML] index.html (Portal Oficial FipSOs v3.1 - Arquitectura Abierta)", cx + 12, fy + 48, 0xE2E8F0);
         draw_text("Acelerador C11 nativo bajo sandbox FfiJail con memoria DMA.", cx + 12, fy + 64, 0xFDBA74);
         draw_text("Descargas HTTP directas por DMA PCIe e1000e al disco SATA AHCI.", cx + 12, fy + 80, 0x67E8F9);
         draw_text("Persistencia en disco SATA LBA 20..21 verificada con checksum.", cx + 12, fy + 96, 0x4ADE80);
@@ -1287,51 +1457,79 @@ void draw_win_browser(const FloatingWindow& w, bool focused) noexcept {
     draw_button(w.x + 334, by, 150, 26, "Sig. Marcador",  0x4C1D95, 0xC084FC, 0xF8FAFC);
 }
 
-void draw_win_vfs(const FloatingWindow& w, bool focused) noexcept {
+void draw_win_appcenter(const FloatingWindow& w, bool focused) noexcept {
     draw_window_chrome(w, focused);
     const int cx = w.x + 14;
-    const int cy = w.y + 42;
+    const int cy = w.y + 40;
 
-    fill_round_rect(cx, cy, w.w - 28, 146, 6, 0x091220);
-    stroke_round_rect(cx, cy, w.w - 28, 146, 6, 0x1E3A5F);
+    // Header Repository Banner
+    fill_round_rect(cx, cy, w.w - 28, 24, 4, 0x0F1E36);
+    stroke_round_rect(cx, cy, w.w - 28, 24, 4, 0x2563EB);
+    draw_text("Repositorio FipSOs Host: http://10.0.2.2:8080/ [TCP Sockets]", cx + 8, cy + 8, 0x60A5FA);
+
+    // 3 Application Cards
+    for (int i = 0; i < 3; ++i) {
+        const int card_y = cy + 28 + i * 42;
+        const bool is_sel = (i == g_ui.appcenter_selected);
+        const uint32_t bg_col = is_sel ? 0x172554 : 0x0B1324;
+        const uint32_t border_col = is_sel ? 0xFBBF24 : 0x1E3A5F;
+
+        fill_round_rect(cx, card_y, w.w - 28, 38, 5, bg_col);
+        stroke_round_rect(cx, card_y, w.w - 28, 38, 5, border_col);
+
+        if (is_sel) {
+            fill_round_rect(cx + 6, card_y + 11, 5, 16, 2, 0xFBBF24);
+        }
+
+        draw_text(kAppCenterItems[i].name, cx + 16, card_y + 6, is_sel ? 0xFBBF24 : 0x38BDF8);
+        draw_text(kAppCenterItems[i].desc, cx + 16, card_y + 22, 0x94A3B8);
+
+        // Status badge
+        const bool installed = g_ui.appcenter_installed[i];
+        const int badge_x = cx + w.w - 28 - 110;
+        const int badge_y = card_y + 8;
+        if (installed) {
+            fill_round_rect(badge_x, badge_y, 100, 22, 4, 0x064E3B);
+            stroke_round_rect(badge_x, badge_y, 100, 22, 4, 0x34D399);
+            draw_text("INSTALADO", badge_x + 12, badge_y + 7, 0x34D399);
+        } else {
+            fill_round_rect(badge_x, badge_y, 100, 22, 4, 0x451A03);
+            stroke_round_rect(badge_x, badge_y, 100, 22, 4, 0xF59E0B);
+            draw_text("DISPONIBLE", badge_x + 8, badge_y + 7, 0xFBBF24);
+        }
+    }
+
+    // Disk & System Info Row
+    const int inf_y = cy + 158;
+    fill_round_rect(cx, inf_y, w.w - 28, 38, 5, 0x091220);
+    stroke_round_rect(cx, inf_y, w.w - 28, 38, 5, 0x1E3A5F);
 
     size_t p = 0;
-    p = fmt_str(g_ui.fmt, p, "Almacenamiento SATA AHCI 00:1f.2 (");
+    p = fmt_str(g_ui.fmt, p, "SATA AHCI: /disk/bin/ (");
     p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.disk_files_count));
-    p = fmt_str(g_ui.fmt, p, " archivos DiskFS):");
-    draw_text(g_ui.fmt, cx + 10, cy + 8, 0xFBBF24);
-
-    draw_text("[DSK] /disk/boot_log.txt        (LBA 16, 1024 B) [SISTEMA]", cx + 10, cy + 26, 0x38BDF8);
-    draw_text("[DSK] /disk/persistent_note.txt (LBA 18,  512 B) [USUARIO]", cx + 10, cy + 42, 0x67E8F9);
-    draw_text("[DSK] /disk/index.html          (LBA 20,  256 B) [WEB BROWSER]", cx + 10, cy + 58, 0x4ADE80);
-    draw_text("[DSK] /disk/ai_model_v2.bin     (LBA 22, 1024 B) [IA TENSOR]", cx + 10, cy + 74, 0xFDBA74);
+    p = fmt_str(g_ui.fmt, p, " archivos) | Ultima ejecucion: ");
+    p = fmt_str(g_ui.fmt, p, g_ui.appcenter_last_exec);
+    draw_text(g_ui.fmt, cx + 8, inf_y + 6, 0xE2E8F0);
 
     p = 0;
-    p = fmt_str(g_ui.fmt, p, "SATA LBA: ");
-    p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.disk_sectors_read));
-    p = fmt_str(g_ui.fmt, p, " Lecturas / ");
-    p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.disk_sectors_written));
-    p = fmt_str(g_ui.fmt, p, " Escrituras | ");
-    p = fmt_u32(g_ui.fmt, p, static_cast<uint32_t>(g_ui.sys_tel.disk_bytes_transferred / 1024ULL));
-    p = fmt_str(g_ui.fmt, p, " KiB transferidos");
-    draw_text(g_ui.fmt, cx + 10, cy + 94, 0xE2E8F0);
-
-    p = 0;
-    p = fmt_str(g_ui.fmt, p, "Aislamiento CR3: GUI ");
+    p = fmt_str(g_ui.fmt, p, "CR3: ");
     p = fmt_hex_u64(g_ui.fmt, p, g_ui.sys_tel.active_cr3);
-    p = fmt_str(g_ui.fmt, p, " | Shell ");
-    p = fmt_hex_u64(g_ui.fmt, p, g_ui.sys_tel.shell_cr3);
-    draw_text(g_ui.fmt, cx + 10, cy + 110, 0x93C5FD);
+    p = fmt_str(g_ui.fmt, p, " | SMP APIC: 2 Cores | ACPI HLT: ACTIVO");
+    draw_text(g_ui.fmt, cx + 8, inf_y + 22, 0x38BDF8);
 
-    // Last launcher / system status bar
-    fill_round_rect(cx, cy + 154, w.w - 28, 26, 5, 0x0F243C);
-    draw_text("Estado:", cx + 8, cy + 163, 0x38BDF8);
-    draw_text(g_ui.last_action, cx + 70, cy + 163, 0xF8FAFC);
+    // Execution & Console Box
+    const int con_y = inf_y + 42;
+    fill_round_rect(cx, con_y, w.w - 28, 34, 5, 0x080E1A);
+    stroke_round_rect(cx, con_y, w.w - 28, 34, 5, 0x334155);
+    draw_text("Consola:", cx + 8, con_y + 5, 0x38BDF8);
+    draw_text(g_ui.appcenter_console, cx + 64, con_y + 5, 0xF8FAFC);
 
+    // 4 Action Buttons at bottom
     const int by = w.y + w.h - 36;
-    draw_button(w.x + 14,  by, 160, 26, "Guardar Nota",      0x1B2A4A, 0x38BDF8, 0xF8FAFC);
-    draw_button(w.x + 184, by, 175, 26, "Borrar sys_unlink", 0x4A1520, 0xEF4444, 0xF8FAFC);
-    draw_button(w.x + 370, by, 190, 26, "Lanzar Linux C",     0x064E3B, 0x34D399, 0xF8FAFC);
+    draw_button(w.x + 14,  by, 160, 26, "Instalar via TCP", 0x1E3A8A, 0x38BDF8, 0xF8FAFC);
+    draw_button(w.x + 184, by, 140, 26, "Lanzar App",       0x064E3B, 0x34D399, 0xF8FAFC);
+    draw_button(w.x + 334, by, 130, 26, "Ciclar App",       0x4C1D95, 0xC084FC, 0xF8FAFC);
+    draw_button(w.x + 474, by, 112, 26, "Guardar Dsk",      0x1B2A4A, 0xFBBF24, 0xF8FAFC);
 }
 
 void draw_win_sphere(const FloatingWindow& w, bool focused) noexcept {
@@ -1395,7 +1593,7 @@ void draw_floating_window(int wid, bool focused) noexcept {
     } else if (wid == 2) {
         draw_win_browser(w, focused);
     } else {
-        draw_win_vfs(w, focused);
+        draw_win_appcenter(w, focused);
     }
 }
 
@@ -1403,10 +1601,10 @@ void draw_start_menu() noexcept {
     if (!g_ui.start_open) {
         return;
     }
-    constexpr int sx = 420;
-    constexpr int sy = 392;
-    constexpr int sw = 440;
-    constexpr int sh = 350;
+    const int sw = 440;
+    const int sh = 350;
+    const int sx = (g_ui.screen_w - sw) / 2;
+    const int sy = g_ui.taskbar_y - sh - 8;
 
     draw_shadow(sx, sy, sw, sh);
     blend_round_rect(sx, sy, sw, sh, 10, 0x0E1B30, 244);
@@ -1415,9 +1613,9 @@ void draw_start_menu() noexcept {
     // Search bar pill
     fill_round_rect(sx + 20, sy + 16, sw - 40, 30, 6, 0x081120);
     stroke_round_rect(sx + 20, sy + 16, sw - 40, 30, 6, 0x28476E);
-    draw_text("> Buscar apps ELF64, VMO, eth0 o NPU...", sx + 32, sy + 27, 0x94A3B8);
+    draw_text("> Buscar apps ELF64, VMO, eth0 o SIMD...", sx + 32, sy + 27, 0x94A3B8);
 
-    draw_text("Anclado - Lanzador de Aplicaciones FipSOs v1.8", sx + 22, sy + 58, 0xE2E8F0);
+    draw_text("Anclado - Lanzador de Aplicaciones FipSOs v3.1", sx + 22, sy + 58, 0xE2E8F0);
 
     struct AppTile {
         const char* title;
@@ -1425,12 +1623,12 @@ void draw_start_menu() noexcept {
         int         icon_kind;
     };
     constexpr AppTile kTiles[6] = {
-        {"Admin Tareas", "Procesos & WiFi", 0},
+        {"Admin Tareas", "Procesos & CPU",  0},
         {"Navegador",    "Web & Descargas", 1},
-        {"Disco SATA",   "DiskFS Persist",  2},
+        {"App Center",   "TCP Software Dsk", 2},
         {"npu_infer",    "Rust ELF64",      3},
         {"avatar_cpp",   "C++20 ELF64",     1},
-        {"WiFi & Audio", "Scan & Beep",     0},
+        {"Terminal TTY", "Consola Shell",   0},
     };
 
     for (int i = 0; i < 6; ++i) {
@@ -1463,7 +1661,7 @@ void draw_start_menu() noexcept {
     fill_rect(sx + 1, sy + sh - 52, sw - 2, 1, 0x223B5B);
     fill_round_rect(sx + 14, sy + sh - 40, 26, 26, 13, 0x0284C7);
     draw_text("FP", sx + 19, sy + sh - 31, 0xFFFFFF);
-    draw_text("v1.8", sx + 45, sy + sh - 31, 0x94A3B8);
+    draw_text("v3.1", sx + 45, sy + sh - 31, 0x94A3B8);
 
     draw_button(sx + 82,       sy + sh - 40, 110, 28, "Probar Fault", 0x4A1520, 0xEF4444, 0xFEE2E2);
     draw_button(sx + 82 + 116, sy + sh - 40, 110, 28, "Salir a TTY",  0x2D1B4E, 0xA855F7, 0xF3E8FF);
@@ -1471,24 +1669,24 @@ void draw_start_menu() noexcept {
 }
 
 void draw_taskbar() noexcept {
-    // Windows 11 Frosted Dark Mica Translucent Bottom Bar (y = 752..800)
-    blend_rect(0, kTaskbarY, kScreenW, kTaskbarH, 0x08101E, 224);
-    fill_rect(0, kTaskbarY, kScreenW, 1, 0x2E4F7A);
+    // Windows 11 Frosted Dark Mica Translucent Bottom Bar
+    blend_rect(0, g_ui.taskbar_y, g_ui.screen_w, g_ui.taskbar_h, 0x08101E, 224);
+    fill_rect(0, g_ui.taskbar_y, g_ui.screen_w, 1, 0x2E4F7A);
 
     // Left System Badge
-    fill_round_rect(14, kTaskbarY + 8, 188, 32, 6, 0x101E34);
-    stroke_round_rect(14, kTaskbarY + 8, 188, 32, 6, 0x223B5C);
-    fill_round_rect(24, kTaskbarY + 19, 8, 8, 4, 0x10B981);
-    draw_text("FipSOs v1.9 Shell", 40, kTaskbarY + 20, 0xE2E8F0);
+    fill_round_rect(14, g_ui.taskbar_y + 8, 188, 32, 6, 0x101E34);
+    stroke_round_rect(14, g_ui.taskbar_y + 8, 188, 32, 6, 0x223B5C);
+    fill_round_rect(24, g_ui.taskbar_y + 19, 8, 8, 4, 0x10B981);
+    draw_text("FipSOs v3.1", 38, g_ui.taskbar_y + 20, 0xE2E8F0);
 
-    // Centered Windows 11 Icon Dock (6 buttons @ x = 500..780)
-    constexpr int dock_x0     = 500;
+    // Centered Windows 11 Icon Dock (6 buttons)
     constexpr int dock_stride = 48;
-    const int top_win = g_ui.z_order[3];
+    const int dock_x0         = (g_ui.screen_w - (6 * dock_stride)) / 2;
+    const int top_win         = g_ui.z_order[3];
 
     for (int i = 0; i < 6; ++i) {
         const int bx  = dock_x0 + i * dock_stride;
-        const int by  = kTaskbarY + 6;
+        const int by  = g_ui.taskbar_y + 6;
         const bool hov = pt_in_rect(g_ui.mouse_x, g_ui.mouse_y, bx, by, 40, 36);
         const bool act = (i == 0 && g_ui.start_open) ||
                          (i >= 1 && i <= 4 && g_ui.wins[i - 1].open && !g_ui.wins[i - 1].minimized && top_win == (i - 1));
@@ -1522,11 +1720,13 @@ void draw_taskbar() noexcept {
     }
 
     // Right System Tray (ETH0, SATA, RAM, CMOS RTC Clock)
-    fill_round_rect(948, kTaskbarY + 8, 318, 32, 6, 0x101E34);
-    stroke_round_rect(948, kTaskbarY + 8, 318, 32, 6, 0x223B5C);
+    constexpr int tray_w = 318;
+    const int tray_x     = g_ui.screen_w - tray_w - 14;
+    fill_round_rect(tray_x, g_ui.taskbar_y + 8, tray_w, 32, 6, 0x101E34);
+    stroke_round_rect(tray_x, g_ui.taskbar_y + 8, tray_w, 32, 6, 0x223B5C);
 
     // ETH0 status dot
-    fill_round_rect(958, kTaskbarY + 20, 7, 7, 3, (g_ui.sys_tel.net_link_up != 0U) ? 0x4ADE80 : 0xF87171);
+    fill_round_rect(tray_x + 10, g_ui.taskbar_y + 20, 7, 7, 3, (g_ui.sys_tel.net_link_up != 0U) ? 0x4ADE80 : 0xF87171);
 
     const uint32_t used_mib = g_ui.sys_tel.ram_used_kib / 1024U;
     const uint32_t hh       = static_cast<uint32_t>(g_ui.sys_tel.rtc_hour);
@@ -1534,8 +1734,7 @@ void draw_taskbar() noexcept {
     const uint32_t ss       = static_cast<uint32_t>(g_ui.sys_tel.rtc_sec);
 
     size_t p = 0;
-    p = fmt_str(g_ui.fmt, p, (g_ui.sys_tel.wifi_active_iface == 1) ? "WLAN0" : "ETH0");
-    p = fmt_str(g_ui.fmt, p, " | SATA | ");
+    p = fmt_str(g_ui.fmt, p, "ETH0 | SATA | ");
     p = fmt_u32(g_ui.fmt, p, used_mib);
     p = fmt_str(g_ui.fmt, p, "M | RTC ");
     p = fmt_u32_pad2(g_ui.fmt, p, hh);
@@ -1543,16 +1742,16 @@ void draw_taskbar() noexcept {
     p = fmt_u32_pad2(g_ui.fmt, p, mm);
     p = fmt_str(g_ui.fmt, p, ":");
     p = fmt_u32_pad2(g_ui.fmt, p, ss);
-    draw_text(g_ui.fmt, 970, kTaskbarY + 20, 0xE2E8F0);
+    draw_text(g_ui.fmt, tray_x + 22, g_ui.taskbar_y + 20, 0xE2E8F0);
 }
 
 // --- Unified Dirty-Rectangle Compositor & Zero-Copy DMA Flip ---
 
 void compose_region_to_backbuf(int rx, int ry, int rw, int rh) noexcept {
-    const int x0 = clamp_i(rx, 0, kScreenW);
-    const int y0 = clamp_i(ry, 0, kScreenH);
-    const int x1 = clamp_i(rx + rw, 0, kScreenW);
-    const int y1 = clamp_i(ry + rh, 0, kScreenH);
+    const int x0 = clamp_i(rx, 0, g_ui.screen_w);
+    const int y0 = clamp_i(ry, 0, g_ui.screen_h);
+    const int x1 = clamp_i(rx + rw, 0, g_ui.screen_w);
+    const int y1 = clamp_i(ry + rh, 0, g_ui.screen_h);
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
@@ -1561,7 +1760,7 @@ void compose_region_to_backbuf(int rx, int ry, int rw, int rh) noexcept {
 
     render_wallpaper_clipped();
 
-    if (y0 < kTaskbarY) {
+    if (y0 < g_ui.taskbar_y) {
         draw_desktop_shortcuts();
 
         const int top_id = g_ui.z_order[3];
@@ -1577,22 +1776,26 @@ void compose_region_to_backbuf(int rx, int ry, int rw, int rh) noexcept {
         }
 
         if (g_ui.start_open) {
-            const Rect sbounds{416, 388, 450, 360};
+            const int sw = 440;
+            const int sh = 350;
+            const int sx = (g_ui.screen_w - sw) / 2;
+            const int sy = g_ui.taskbar_y - sh - 8;
+            const Rect sbounds{sx - 4, sy - 4, sw + 10, sh + 10};
             if (rects_intersect(g_ui.clip, sbounds)) {
                 draw_start_menu();
             }
         }
     }
 
-    if (y1 > kTaskbarY) {
+    if (y1 > g_ui.taskbar_y) {
         draw_taskbar();
     }
 
-    g_ui.clip = Rect{0, 0, kScreenW, kScreenH};
+    g_ui.clip = Rect{0, 0, g_ui.screen_w, g_ui.screen_h};
 }
 
 void compose_all_to_backbuf() noexcept {
-    compose_region_to_backbuf(0, 0, kScreenW, kScreenH);
+    compose_region_to_backbuf(0, 0, g_ui.screen_w, g_ui.screen_h);
 }
 
 void flip_full() noexcept {
@@ -1600,10 +1803,10 @@ void flip_full() noexcept {
 }
 
 void flip_dirty_rect(const Rect& r) noexcept {
-    const int x0 = clamp_i(r.x, 0, kScreenW);
-    const int y0 = clamp_i(r.y, 0, kScreenH);
-    const int x1 = clamp_i(r.x + r.w, 0, kScreenW);
-    const int y1 = clamp_i(r.y + r.h, 0, kScreenH);
+    const int x0 = clamp_i(r.x, 0, g_ui.screen_w);
+    const int y0 = clamp_i(r.y, 0, g_ui.screen_h);
+    const int x1 = clamp_i(r.x + r.w, 0, g_ui.screen_w);
+    const int y1 = clamp_i(r.y + r.h, 0, g_ui.screen_h);
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
@@ -1647,17 +1850,20 @@ void focus_window(int wid) noexcept {
 }
 
 void handle_left_press(int mx, int my) noexcept {
-    // 1. Taskbar clicks (y >= 752)
-    if (my >= kTaskbarY) {
-        constexpr int dock_x0     = 500;
-        constexpr int dock_stride = 48;
+    const int dock_x0 = (g_ui.screen_w - 288) / 2;
+    constexpr int dock_stride = 48;
+
+    // 1. Taskbar clicks
+    if (my >= g_ui.taskbar_y) {
         for (int i = 0; i < 6; ++i) {
             const int bx = dock_x0 + i * dock_stride;
-            const int by = kTaskbarY + 6;
+            const int by = g_ui.taskbar_y + 6;
             if (pt_in_rect(mx, my, bx, by, 40, 36)) {
                 if (i == 0) {
                     g_ui.start_open = !g_ui.start_open;
-                    repaint_and_flip(Rect{414, 386, 456, 414});
+                    const int sx = (g_ui.screen_w - 440) / 2;
+                    const int sy = g_ui.taskbar_y - 350 - 6;
+                    repaint_and_flip(Rect{sx - 6, sy - 6, 440 + 12, 350 + 12});
                 } else if (i >= 1 && i <= 4) {
                     const int wid = i - 1;
                     g_ui.start_open = false;
@@ -1679,8 +1885,8 @@ void handle_left_press(int mx, int my) noexcept {
 
     // 2. Start Menu clicks if open
     if (g_ui.start_open) {
-        constexpr int sx = 420;
-        constexpr int sy = 392;
+        const int sx = (g_ui.screen_w - 440) / 2;
+        const int sy = g_ui.taskbar_y - 350 - 6;
         constexpr int sw = 440;
         constexpr int sh = 350;
         if (pt_in_rect(mx, my, sx, sy, sw, sh)) {
@@ -1711,9 +1917,7 @@ void handle_left_press(int mx, int my) noexcept {
                     } else if (i == 4) {
                         action_launch_elf("/bin/c_std_app.elf", "c_std_app.elf");
                     } else {
-                        action_toggle_wifi();
-                        compose_all_to_backbuf();
-                        flip_full();
+                        g_ui.should_exit = true; // Salir a consola TTY
                     }
                     return;
                 }
@@ -1722,7 +1926,7 @@ void handle_left_press(int mx, int my) noexcept {
         }
         // Clicked outside Start Menu -> close it cleanly
         g_ui.start_open = false;
-        repaint_and_flip(Rect{414, 386, 456, 414});
+        repaint_and_flip(Rect{sx - 6, sy - 6, sw + 12, sh + 12});
     }
 
     // 3. Floating Windows (front-to-back Z-order hit test)
@@ -1744,15 +1948,15 @@ void handle_left_press(int mx, int my) noexcept {
         const int cls_x = w.x + w.w - 30;
         const int btn_y = w.y + 6;
         if (pt_in_rect(mx, my, min_x, btn_y, 24, 20)) {
-            const Rect dirty = union_rect(win_shadow_rect(w), Rect{496, kTaskbarY, 290, kTaskbarH});
             w.minimized = true;
-            repaint_and_flip(dirty);
+            compose_all_to_backbuf();
+            flip_full();
             return;
         }
         if (pt_in_rect(mx, my, cls_x, btn_y, 24, 20)) {
-            const Rect dirty = union_rect(win_shadow_rect(w), Rect{496, kTaskbarY, 290, kTaskbarH});
             w.open = false;
-            repaint_and_flip(dirty);
+            compose_all_to_backbuf();
+            flip_full();
             return;
         }
 
@@ -1776,7 +1980,9 @@ void handle_left_press(int mx, int my) noexcept {
             } else if (pt_in_rect(mx, my, w.x + 170, by, 145, 26)) {
                 action_kill_task();
             } else if (pt_in_rect(mx, my, w.x + 326, by, 150, 26)) {
-                action_toggle_wifi();
+                action_refresh_net();
+                compose_all_to_backbuf();
+                flip_full();
             }
         } else if (wid == 1) {
             if (pt_in_rect(mx, my, w.x + 14, by, 160, 26)) {
@@ -1799,13 +2005,27 @@ void handle_left_press(int mx, int my) noexcept {
                 action_cycle_bookmark();
             }
         } else if (wid == 3) {
+            const int cx = w.x + 14;
+            const int cy = w.y + 40;
+            // Card clicks to select app
+            for (int i = 0; i < 3; ++i) {
+                const int card_y = cy + 28 + i * 42;
+                if (pt_in_rect(mx, my, cx, card_y, w.w - 28, 38)) {
+                    g_ui.appcenter_selected = i;
+                    action_appcenter_cycle();
+                    compose_all_to_backbuf();
+                    flip_full();
+                    return;
+                }
+            }
             if (pt_in_rect(mx, my, w.x + 14, by, 160, 26)) {
+                action_appcenter_install();
+            } else if (pt_in_rect(mx, my, w.x + 184, by, 140, 26)) {
+                action_appcenter_launch();
+            } else if (pt_in_rect(mx, my, w.x + 334, by, 130, 26)) {
+                action_appcenter_cycle();
+            } else if (pt_in_rect(mx, my, w.x + 474, by, 112, 26)) {
                 action_save_disk();
-            } else if (pt_in_rect(mx, my, w.x + 184, by, 175, 26)) {
-                action_delete_sata_file();
-            } else if (pt_in_rect(mx, my, w.x + 370, by, 190, 26)) {
-                action_launch_elf("/bin/c_std_app.elf", "c_std_app.elf");
-                return;
             }
         }
 
@@ -1842,11 +2062,10 @@ void handle_pointer_motion(int mx, int my, uint8_t btns) noexcept {
     if ((btns & fipsos::MOUSE_BTN_LEFT) != 0U) {
         if (g_ui.dragging_win >= 0) {
             FloatingWindow& w = g_ui.wins[g_ui.dragging_win];
-            const Rect old_r  = win_shadow_rect(w);
-            w.x = clamp_i(mx - g_ui.drag_off_x, 8, kScreenW - w.w - 8);
-            w.y = clamp_i(my - g_ui.drag_off_y, 8, kTaskbarY - w.h - 6);
-            const Rect new_r = win_shadow_rect(w);
-            repaint_and_flip(union_rect(old_r, new_r));
+            w.x = clamp_i(mx - g_ui.drag_off_x, 8, g_ui.screen_w - w.w - 8);
+            w.y = clamp_i(my - g_ui.drag_off_y, 8, g_ui.taskbar_y - w.h - 6);
+            compose_all_to_backbuf();
+            flip_full();
             return;
         }
 
@@ -1873,10 +2092,11 @@ void handle_pointer_motion(int mx, int my, uint8_t btns) noexcept {
     }
 
     // Dock hover highlight dirty update
+    const int dock_x0 = (g_ui.screen_w - 288) / 2;
     int new_dock = -1;
-    if (my >= kTaskbarY) {
+    if (my >= g_ui.taskbar_y) {
         for (int i = 0; i < 6; ++i) {
-            if (pt_in_rect(mx, my, 500 + i * 48, kTaskbarY + 6, 40, 36)) {
+            if (pt_in_rect(mx, my, dock_x0 + i * 48, g_ui.taskbar_y + 6, 40, 36)) {
                 new_dock = i;
                 break;
             }
@@ -1884,14 +2104,16 @@ void handle_pointer_motion(int mx, int my, uint8_t btns) noexcept {
     }
     if (new_dock != g_ui.hover_dock) {
         g_ui.hover_dock = new_dock;
-        repaint_and_flip(Rect{496, kTaskbarY, 290, kTaskbarH});
+        repaint_and_flip(Rect{dock_x0 - 4, g_ui.taskbar_y, 290, g_ui.taskbar_h});
     }
 
     if (g_ui.start_open) {
+        const int sx = (g_ui.screen_w - 440) / 2;
+        const int sy = g_ui.taskbar_y - 350 - 6;
         int new_tile = -1;
         for (int i = 0; i < 6; ++i) {
-            const int tx = 440 + (i % 3) * 140;
-            const int ty = 470 + (i / 3) * 96;
+            const int tx = sx + 20 + (i % 3) * 140;
+            const int ty = sy + 78 + (i / 3) * 96;
             if (pt_in_rect(mx, my, tx, ty, 120, 84)) {
                 new_tile = i;
                 break;
@@ -1899,7 +2121,7 @@ void handle_pointer_motion(int mx, int my, uint8_t btns) noexcept {
         }
         if (new_tile != g_ui.hover_start_tile) {
             g_ui.hover_start_tile = new_tile;
-            repaint_and_flip(Rect{420, 392, 440, 350});
+            repaint_and_flip(Rect{sx, sy, 440, 350});
         }
     }
 }
@@ -1925,24 +2147,24 @@ void handle_key(uint8_t key) noexcept {
         if (key == 'A') { // Up
             g_ui.pitch_rad = clamp_f(g_ui.pitch_rad + 0.15f, -1.3f, 1.3f);
             recompute_sphere_tile();
-            repaint_and_flip(Rect{540, 40, 380, 330});
+            repaint_and_flip(win_shadow_rect(g_ui.wins[1]));
             return;
         } else if (key == 'B') { // Down
             g_ui.pitch_rad = clamp_f(g_ui.pitch_rad - 0.15f, -1.3f, 1.3f);
             recompute_sphere_tile();
-            repaint_and_flip(Rect{540, 40, 380, 330});
+            repaint_and_flip(win_shadow_rect(g_ui.wins[1]));
             return;
         } else if (key == 'C') { // Right
             g_ui.yaw_rad += 0.15f;
             if (g_ui.yaw_rad > 3.14159f) g_ui.yaw_rad -= 6.28318f;
             recompute_sphere_tile();
-            repaint_and_flip(Rect{540, 40, 380, 330});
+            repaint_and_flip(win_shadow_rect(g_ui.wins[1]));
             return;
         } else if (key == 'D') { // Left
             g_ui.yaw_rad -= 0.15f;
             if (g_ui.yaw_rad < -3.14159f) g_ui.yaw_rad += 6.28318f;
             recompute_sphere_tile();
-            repaint_and_flip(Rect{540, 40, 380, 330});
+            repaint_and_flip(win_shadow_rect(g_ui.wins[1]));
             return;
         }
         return;
@@ -1952,7 +2174,9 @@ void handle_key(uint8_t key) noexcept {
         g_ui.should_exit = true;
     } else if (key == ' ' || key == 0x11U) {
         g_ui.start_open = !g_ui.start_open;
-        repaint_and_flip(Rect{414, 386, 456, 414});
+        const int sx = (g_ui.screen_w - 440) / 2;
+        const int sy = g_ui.taskbar_y - 350 - 6;
+        repaint_and_flip(Rect{sx - 6, sy - 6, 440 + 12, 350 + 12});
     } else if (key >= '1' && key <= '4') {
         const int wid = static_cast<int>(key - '1');
         g_ui.start_open = false;
@@ -1990,11 +2214,19 @@ void handle_key(uint8_t key) noexcept {
         compose_all_to_backbuf();
         flip_full();
     } else if (key == 'w' || key == 'W') {
-        action_toggle_wifi();
+        action_refresh_net();
+        compose_all_to_backbuf();
+        flip_full();
+    } else if (key == 'a' || key == 'A') {
+        action_appcenter_cycle();
+        compose_all_to_backbuf();
+        flip_full();
+    } else if (key == 'l' || key == 'L') {
+        action_appcenter_launch();
         compose_all_to_backbuf();
         flip_full();
     } else if (key == 'i' || key == 'I') {
-        action_browser_get();
+        action_appcenter_install();
         compose_all_to_backbuf();
         flip_full();
     } else if (key == 'm' || key == 'M') {
@@ -2019,7 +2251,7 @@ extern "C" void desktop_main() noexcept {
     using namespace fipsos;
 
     print_literal(
-        "[desktop_ui.elf] FipSOs Shell UI v1.9 (4 Ventanas Flotantes + Linux C stdlib + System V ABI + SATA + WiFi) activo!\n"
+        "[desktop_ui.elf] FipSOs Shell UI v3.1 (4 Ventanas Flotantes | SMP Multicore | PCIe e1000e | SATA AHCI) activo!\n"
     );
 
     g_ui.pid              = sys_getpid();
@@ -2038,13 +2270,43 @@ extern "C" void desktop_main() noexcept {
         sys_exit(1);
     }
 
-    constexpr size_t kBackbufBytes = static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) * 4ULL;
+    // Query physical display resolution & pitch reported by Limine Framebuffer
+    fb_info finfo{};
+    int64_t vres = sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), FB_IOCTL_GET_INFO, reinterpret_cast<uint64_t>(&finfo));
+    if (vres >= 0 && finfo.width > 0 && finfo.height > 0) {
+        g_ui.screen_w = static_cast<int>(finfo.width);
+        g_ui.screen_h = static_cast<int>(finfo.height);
+        g_ui.fb_pitch = static_cast<int>(finfo.pitch > 0 ? finfo.pitch : finfo.width * 4);
+        g_ui.bpp      = static_cast<int>(finfo.bpp > 0 ? finfo.bpp : 32);
+    } else {
+        fb_var_screeninfo vinfo{};
+        vres = sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), FBIOGET_VSCREENINFO, reinterpret_cast<uint64_t>(&vinfo));
+        if (vres < 0) {
+            vres = sys_ioctl(static_cast<uint64_t>(g_ui.fb_fd), FB_IOCTL_GET_VSCREENINFO, reinterpret_cast<uint64_t>(&vinfo));
+        }
+        if (vres >= 0 && vinfo.xres > 0 && vinfo.yres > 0) {
+            g_ui.screen_w = static_cast<int>(vinfo.xres);
+            g_ui.screen_h = static_cast<int>(vinfo.yres);
+            g_ui.fb_pitch = static_cast<int>(vinfo.bytes_per_line > 0 ? vinfo.bytes_per_line : vinfo.xres * 4);
+            g_ui.bpp      = static_cast<int>(vinfo.bits_per_pixel > 0 ? vinfo.bits_per_pixel : 32);
+        } else {
+            // Fallback default
+            g_ui.screen_w = 1024;
+            g_ui.screen_h = 768;
+            g_ui.fb_pitch = 4096;
+            g_ui.bpp      = 32;
+        }
+    }
+    g_ui.taskbar_h = 48;
+    g_ui.taskbar_y = g_ui.screen_h - g_ui.taskbar_h;
+
+    const size_t kBackbufBytes = static_cast<size_t>(g_ui.screen_h) * static_cast<size_t>(g_ui.fb_pitch);
     const int64_t mapped = sys_mmap(0, kBackbufBytes, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(g_ui.fb_fd), 0);
     if (mapped <= 0) {
         sys_exit(2);
     }
     g_ui.backbuf = reinterpret_cast<uint32_t*>(mapped);
-    g_ui.clip    = Rect{0, 0, kScreenW, kScreenH};
+    g_ui.clip    = Rect{0, 0, g_ui.screen_w, g_ui.screen_h};
 
     // Initialize 3D Phong Sphere state & Aurora LUTs
     g_ui.yaw_rad      = 0.42f;
@@ -2060,11 +2322,16 @@ extern "C" void desktop_main() noexcept {
     g_ui.spark_head = 0U;
     set_cstr(g_ui.last_action, sizeof(g_ui.last_action), "Listo - Haz clic en apps o botones");
 
-    // Configure 4 Floating Windows (cleanly arranged across 1280x752)
-    g_ui.wins[0] = FloatingWindow{0, 40,  40,  480, 330, true, false, 0x00F5D4, "Admin de Tareas & WiFi 802.11"};
-    g_ui.wins[1] = FloatingWindow{1, 540, 40,  380, 330, true, false, 0x818CF8, "Visor 3D Phong — FP32 SSE2"};
-    g_ui.wins[2] = FloatingWindow{2, 40,  390, 580, 345, true, false, 0x38BDF8, "Navegador Web & HTTP Downloader"};
-    g_ui.wins[3] = FloatingWindow{3, 640, 390, 600, 345, true, false, 0xFBBF24, "Explorador SATA AHCI & Apps Linux C"};
+    // Configure 4 Floating Windows proportionally to detected screen resolution
+    const int margin_x = 24;
+    const int margin_y = 24;
+    const int half_w = (g_ui.screen_w - (margin_x * 2 + 16)) / 2;
+    const int half_h = (g_ui.taskbar_y - (margin_y * 2 + 16)) / 2;
+
+    g_ui.wins[0] = FloatingWindow{0, margin_x, margin_y, half_w, half_h, true, false, 0x00F5D4, "Admin de Tareas & Rendimiento SMP"};
+    g_ui.wins[1] = FloatingWindow{1, margin_x + half_w + 16, margin_y, half_w, half_h, true, false, 0x818CF8, "Visor 3D Phong — FP32 SSE2"};
+    g_ui.wins[2] = FloatingWindow{2, margin_x, margin_y + half_h + 16, half_w, half_h, true, false, 0x38BDF8, "Navegador Web & HTTP Downloader"};
+    g_ui.wins[3] = FloatingWindow{3, margin_x + half_w + 16, margin_y + half_h + 16, half_w, half_h, true, false, 0xFBBF24, "Centro de Aplicaciones & Consola de Ejecucion"};
     g_ui.z_order[0] = 0;
     g_ui.z_order[1] = 1;
     g_ui.z_order[2] = 2;
@@ -2075,6 +2342,13 @@ extern "C" void desktop_main() noexcept {
     set_cstr(g_ui.browser_status, sizeof(g_ui.browser_status), "Listo para GET TCP");
     g_ui.browser_downloaded_body[0] = '\0';
     g_ui.selected_disk_file = 0;
+
+    g_ui.appcenter_selected = 0;
+    g_ui.appcenter_installed[0] = false;
+    g_ui.appcenter_installed[1] = false;
+    g_ui.appcenter_installed[2] = false;
+    set_cstr(g_ui.appcenter_console, sizeof(g_ui.appcenter_console), "Listo. Servidor http://10.0.2.2:8080/ [TCP]");
+    set_cstr(g_ui.appcenter_last_exec, sizeof(g_ui.appcenter_last_exec), "Ninguna");
 
     init_wallpaper_luts();
     recompute_sphere_tile();
@@ -2148,7 +2422,7 @@ extern "C" void desktop_main() noexcept {
                 last_tel_tick = g_ui.sys_tel.irq0_ticks;
                 push_spark_sample(static_cast<uint8_t>(10U + ((g_ui.sys_tel.daemon_switches * 5U) % 24U)));
                 // Surgical dirty-rect update for System Tray clock & Monitor window if visible
-                repaint_and_flip(Rect{946, kTaskbarY + 6, 322, 36});
+                repaint_and_flip(Rect{g_ui.screen_w - 334, g_ui.taskbar_y + 6, 322, 36});
                 if (g_ui.wins[0].open && !g_ui.wins[0].minimized && g_ui.dragging_win < 0) {
                     repaint_and_flip(win_shadow_rect(g_ui.wins[0]));
                 }
@@ -2173,7 +2447,7 @@ extern "C" void desktop_main() noexcept {
     }
     sys_close(static_cast<uint64_t>(g_ui.fb_fd));
 
-    print_literal("[desktop_ui.elf] Sesion grafica finalizada limpiamente. Retornando a TTY fipsos@v1.9:/$\n");
+    print_literal("[desktop_ui.elf] Sesion grafica finalizada limpiamente. Retornando a TTY fipsos@v3.1:/$\n");
     sys_exit(0);
 }
 

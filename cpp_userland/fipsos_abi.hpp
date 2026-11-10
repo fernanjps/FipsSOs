@@ -46,6 +46,16 @@ constexpr uint64_t PROT_READ       = 0x1;
 constexpr uint64_t PROT_WRITE      = 0x2;
 constexpr uint64_t MAP_SHARED      = 0x1;
 
+constexpr uint64_t FB_IOCTL_GET_INFO           = 0x4600ULL;
+constexpr uint64_t FBIOGET_VSCREENINFO         = 0x4600ULL;
+constexpr uint64_t FB_IOCTL_GET_VSCREENINFO    = 0xC0104600ULL;
+
+struct fb_info {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+};
 constexpr uint64_t ACCEL_IOCTL_RUN_INFERENCE  = 0xC0104102ULL;
 constexpr uint64_t FB_IOCTL_PRESENT_RECT      = 0xC0104601ULL;
 constexpr uint64_t FB_IOCTL_POLL_KEY          = 0xC0104602ULL;
@@ -56,9 +66,6 @@ constexpr uint64_t MOUSE_IOCTL_STEP_SYNTHETIC = 0xC0104D02ULL;
 constexpr uint64_t NET_IOCTL_PING_GATEWAY     = 0xC0104E01ULL;
 constexpr uint64_t NET_IOCTL_HTTP_FETCH       = 0xC0104E02ULL;
 constexpr uint64_t NET_IOCTL_BROWSER_FETCH_SAVE = 0xC0104E03ULL;
-constexpr uint64_t WIFI_IOCTL_SCAN            = 0xC0105701ULL;
-constexpr uint64_t WIFI_IOCTL_STATUS          = 0xC0105702ULL;
-constexpr uint64_t AUDIO_IOCTL_BEEP           = 0xC0105302ULL;
 constexpr uint64_t DISK_IOCTL_SAVE_NOTE       = 0xC0104401ULL;
 constexpr uint64_t DISK_IOCTL_DELETE_FILE     = 0xC0104402ULL;
 constexpr uint64_t VFS_IOCTL_TASK_CONTROL     = 0xC0105003ULL;
@@ -74,6 +81,18 @@ constexpr uint8_t MOUSE_BTN_MIDDLE = 0x04;
 struct Timespec {
     int64_t tv_sec;
     int64_t tv_nsec;
+};
+
+struct fb_var_screeninfo {
+    uint32_t xres;
+    uint32_t yres;
+    uint32_t xres_virtual;
+    uint32_t yres_virtual;
+    uint32_t xoffset;
+    uint32_t yoffset;
+    uint32_t bits_per_pixel;
+    uint32_t bytes_per_line;
+    uint32_t reserved[8];
 };
 
 struct MousePacketState {
@@ -134,18 +153,13 @@ struct SysTelemetryPacket {
     uint16_t physical_cores;
     uint16_t logical_threads;
     uint32_t driver_health_mask;
-    // --- FASE v1.8: WiFi 802.11, Audio, Tareas en segundo plano y Archivos SATA ---
-    uint8_t  wifi_link_up;
-    uint8_t  wifi_channel;
-    uint8_t  wifi_security;
-    uint8_t  wifi_active_iface; // 0=eth0, 1=wlan0
-    int32_t  wifi_rssi_dbm;
-    uint32_t audio_beeps_count;
+    // --- FASE v2.5: Hardware Real e1000e, SATA AHCI, SMP slots ---
+    uint8_t  reserved_pad1[12];
     uint8_t  bg_task_state;     // 0=inactivo, 1=ejecutando, 2=terminado
     uint8_t  disk_files_count;
     uint8_t  smp_core0_slot;
     uint8_t  smp_core1_slot;
-    char     wifi_ssid[16];
+    uint8_t  reserved_pad2[16];
 };
 static_assert(sizeof(SysTelemetryPacket) == 192, "SysTelemetryPacket ABI size mismatch");
 

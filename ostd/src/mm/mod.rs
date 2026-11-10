@@ -9,11 +9,12 @@ use limine::memory_map::Entry;
 pub use dma::{DmaBuffer, DmaError, VmFrame};
 pub use frame::{deallocate_frame, stats as memory_stats, FrameAllocator, MemoryStats};
 pub use vm_space::{
-    active_cr3, create_process_pml4, destroy_process_vm_space, expand_user_brk,
-    map_anonymous_user_memory, map_kernel_mmio, map_user_segment, map_vmo_to_user,
-    master_kernel_cr3, protect_user_segment, read_user_bytes, reset_user_brk, switch_cr3,
-    validate_user_buffer, write_user_bytes, ProcessVmSpace, USER_HEAP_BASE_VADDR,
-    USER_HEAP_MAX_VADDR, USER_MMAP_BASE_VADDR, USER_SPACE_LOW_BASE, USER_STACK_DEFAULT_BASE,
+    active_cr3, clone_user_vm_space, create_process_pml4, destroy_process_vm_space,
+    expand_user_brk, map_anonymous_user_memory, map_kernel_mmio, map_user_segment,
+    map_vmo_to_user, master_kernel_cr3, protect_user_segment, read_user_bytes, reset_user_brk,
+    switch_cr3, unmap_user_pages, validate_user_buffer, write_user_bytes, ProcessVmSpace,
+    USER_HEAP_BASE_VADDR, USER_HEAP_MAX_VADDR, USER_MMAP_BASE_VADDR, USER_SPACE_LOW_BASE,
+    USER_STACK_DEFAULT_BASE,
 };
 
 /// Standard hardware page/frame size (4 KiB).

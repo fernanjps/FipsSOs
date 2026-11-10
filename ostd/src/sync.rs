@@ -45,6 +45,14 @@ impl<T> SpinLock<T> {
             None
         }
     }
+
+    /// Forcibly releases the lock.
+    ///
+    /// # Safety
+    /// Must only be used in emergency panics or exception handlers to avoid deadlock.
+    pub unsafe fn force_unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
 }
 
 /// RAII guard that releases the `SpinLock` when dropped.

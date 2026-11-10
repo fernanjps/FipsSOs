@@ -62,13 +62,7 @@ pub struct CpuLocal {
 
 impl CpuLocal {
     pub const fn new() -> Self {
-        Self {
-            kernel_syscall_rsp: 0,
-            user_rsp_scratch: 0,
-            saved_kernel_rsp: 0,
-            user_exit_code: 0,
-            cpu_id: 0,
-        }
+        Self { kernel_syscall_rsp: 0, user_rsp_scratch: 0, saved_kernel_rsp: 0, user_exit_code: 0, cpu_id: 0 }
     }
 }
 
@@ -129,6 +123,8 @@ pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code
             let _ = crate::mm::destroy_process_vm_space(faulted_cr3);
         }
 
+        crate::scheduler::set_active_slot(parent_ctx.parent_slot);
+
         // 3. Restore parent's FPU/SSE2 context (FXRSTOR64)
         parent_ctx.fpu_state.restore();
 
@@ -173,22 +169,20 @@ pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
-    pub rax: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub r10: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub rbx: u64,
-    pub rbp: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub user_rip: u64,
-    pub user_rflags: u64,
-    pub user_rsp: u64,
+    pub rax: u64, pub rdi: u64, pub rsi: u64, pub rdx: u64,
+    pub r10: u64, pub r8: u64, pub r9: u64, pub rbx: u64,
+    pub rbp: u64, pub r12: u64, pub r13: u64, pub r14: u64,
+    pub r15: u64, pub user_rip: u64, pub user_rflags: u64, pub user_rsp: u64,
+}
+
+impl TrapFrame {
+    pub const fn empty(user_rip: u64, user_rsp: u64) -> Self {
+        Self {
+            rax: 0, rdi: 0, rsi: 0, rdx: 0, r10: 0, r8: 0, r9: 0,
+            rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+            user_rip, user_rflags: 0x202, user_rsp,
+        }
+    }
 }
 
 /// Control flow action returned by the high-level syscall dispatcher (`linux_abi`).
@@ -196,25 +190,18 @@ pub struct TrapFrame {
 pub enum SyscallAction {
     /// Return to Ring 3 via `sysretq` with `frame.rax` set to the given return value.
     Continue(u64),
-    /// Save the parent process context (including `parent_cr3`) and enter a child Ring 3 ELF64 binary.
-    SpawnChild {
-        entry_rip: u64,
-        user_rsp: u64,
-        parent_cr3: u64,
-    },
-    /// Terminate the current Ring 3 execution context with the specified exit status.
+    /// Save parent process context and enter a child Ring 3 ELF64 binary.
+    SpawnChild { entry_rip: u64, user_rsp: u64, parent_cr3: u64 },
+    /// Save parent process context, switch CR3 to child_cr3, set frame.rax = 0, and enter child.
+    ForkChild { child_pid: u64, child_cr3: u64, parent_cr3: u64, child_slot: u64, child_rsp: u64 },
+    /// Terminate current Ring 3 execution context with the specified exit status.
     ExitUser(i32),
 }
 
-/// Saved Ring 3 `TrapFrame`, `FXSAVE64` `FpuState`, kernel `saved_kernel_rsp`, and hardware `CR3`
-/// (`parent_cr3`) of a parent process waiting on a synchronous `sys_execve`
-/// (supports nested `Shell -> Desktop UI -> App` with full per-process `PML4` isolation).
+/// Saved Ring 3 context for nested execution (`Shell -> Desktop UI -> App`).
 struct SavedParentContext {
-    fpu_state: FpuState,
-    trap_frame: TrapFrame,
-    saved_kernel_rsp: u64,
-    parent_cr3: u64,
-    user_fs_base: u64,
+    fpu_state: FpuState, trap_frame: TrapFrame, saved_kernel_rsp: u64,
+    parent_cr3: u64, user_fs_base: u64, is_fork: bool, parent_slot: u64,
 }
 
 static PARENT_CONTEXT_STACK: SpinLock<Vec<Box<SavedParentContext>>> = SpinLock::new(Vec::new());
@@ -222,6 +209,15 @@ static PARENT_CONTEXT_STACK: SpinLock<Vec<Box<SavedParentContext>>> = SpinLock::
 /// Returns `true` if a parent Ring 3 process (e.g. Shell or Desktop UI) is stacked waiting for a child.
 pub fn has_parent_context() -> bool {
     !PARENT_CONTEXT_STACK.lock().is_empty()
+}
+
+/// Returns `true` if the top stacked parent was created by `sys_fork` / `sys_clone`.
+pub fn is_parent_fork() -> bool {
+    PARENT_CONTEXT_STACK
+        .lock()
+        .last()
+        .map(|ctx| ctx.is_fork)
+        .unwrap_or(false)
 }
 
 /// Returns the `parent_cr3` physical `PML4` address at the top of `PARENT_CONTEXT_STACK`, if any.
@@ -256,8 +252,7 @@ pub fn setup_sysv_abi_user_stack_args(
     // Place 16 random bytes at 0x0080_3FE0 for AT_RANDOM
     let random_vaddr = stack_base + (stack_size as u64) - 32; // 0x0080_3FE0
     let random_bytes: [u8; 16] = [
-        0x5A, 0x3F, 0x91, 0x2C, 0x88, 0x14, 0x7E, 0xB0,
-        0x19, 0x5C, 0xA4, 0x63, 0xD2, 0x08, 0xFE, 0x47,
+        0x5A, 0x3F, 0x91, 0x2C, 0x88, 0x14, 0x7E, 0xB0, 0x19, 0x5C, 0xA4, 0x63, 0xD2, 0x08, 0xFE, 0x47,
     ];
     write_user_bytes(random_vaddr, &random_bytes)?;
 
@@ -286,21 +281,14 @@ pub fn setup_sysv_abi_user_stack_args(
     table[2 + argc] = 0; // envp[0] = NULL
 
     let mut idx = 3 + argc;
-    // Auxiliary Vector (auxv) entries (type, val)
-    table[idx] = 3; table[idx + 1] = phdr_vaddr; idx += 2; // AT_PHDR
-    table[idx] = 4; table[idx + 1] = phent as u64; idx += 2; // AT_PHENT
-    table[idx] = 5; table[idx + 1] = phnum as u64; idx += 2; // AT_PHNUM
-    table[idx] = 6; table[idx + 1] = 4096; idx += 2; // AT_PAGESZ
-    table[idx] = 7; table[idx + 1] = 0; idx += 2; // AT_BASE
-    table[idx] = 8; table[idx + 1] = 0; idx += 2; // AT_FLAGS
-    table[idx] = 9; table[idx + 1] = entry_rip; idx += 2; // AT_ENTRY
-    table[idx] = 11; table[idx + 1] = 0; idx += 2; // AT_UID
-    table[idx] = 12; table[idx + 1] = 0; idx += 2; // AT_EUID
-    table[idx] = 13; table[idx + 1] = 0; idx += 2; // AT_GID
-    table[idx] = 14; table[idx + 1] = 0; idx += 2; // AT_EGID
-    table[idx] = 23; table[idx + 1] = 0; idx += 2; // AT_SECURE
-    table[idx] = 25; table[idx + 1] = random_vaddr; idx += 2; // AT_RANDOM
-    table[idx] = 0; table[idx + 1] = 0; // AT_NULL
+    let auxv: [(u64, u64); 14] = [
+        (3, phdr_vaddr), (4, phent as u64), (5, phnum as u64), (6, 4096),
+        (7, 0), (8, 0), (9, entry_rip), (11, 0), (12, 0), (13, 0), (14, 0),
+        (23, 0), (25, random_vaddr), (0, 0),
+    ];
+    for (t, v) in auxv {
+        table[idx] = t; table[idx + 1] = v; idx += 2;
+    }
 
     let mut table_raw = alloc::vec![0u8; total_words * 8];
     for (i, word) in table.iter().enumerate() {
@@ -350,6 +338,19 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
     match dispatcher(frame) {
         SyscallAction::Continue(ret_val) => {
             frame.rax = ret_val;
+
+            // Deliver pending signals to userland handler if registered
+            let (active_pid, _) = crate::scheduler::active_pid_and_tid();
+            if let Some((sig, handler)) = crate::scheduler::pop_pending_signal(active_pid) {
+                if handler > 1 {
+                    let new_rsp = (frame.user_rsp.saturating_sub(8)) & !0x7;
+                    if write_user_bytes(new_rsp, &frame.user_rip.to_le_bytes()).is_ok() {
+                        frame.user_rsp = new_rsp;
+                        frame.user_rip = handler;
+                        frame.rdi = sig as u64;
+                    }
+                }
+            }
             0
         }
         SyscallAction::SpawnChild {
@@ -361,12 +362,10 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
             let parent_kernel_rsp =
                 unsafe { core::ptr::read_volatile(&raw const BSP_CPU_LOCAL.saved_kernel_rsp) };
             let parent_fs_base = get_user_fs_base();
+            let parent_slot = crate::scheduler::active_slot();
             let mut parent_ctx = Box::new(SavedParentContext {
-                fpu_state: FpuState::new(),
-                trap_frame: *frame,
-                saved_kernel_rsp: parent_kernel_rsp,
-                parent_cr3,
-                user_fs_base: parent_fs_base,
+                fpu_state: FpuState::new(), trap_frame: *frame, saved_kernel_rsp: parent_kernel_rsp,
+                parent_cr3, user_fs_base: parent_fs_base, is_fork: false, parent_slot,
             });
             parent_ctx.fpu_state.save();
             PARENT_CONTEXT_STACK.lock().push(parent_ctx);
@@ -374,28 +373,47 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
             // Clean child MSR_IA32_FS_BASE for fresh TLS initialization
             set_user_fs_base(0);
 
-            *frame = TrapFrame {
-                rax: 0,
-                rdi: 0,
-                rsi: 0,
-                rdx: 0,
-                r10: 0,
-                r8: 0,
-                r9: 0,
-                rbx: 0,
-                rbp: 0,
-                r12: 0,
-                r13: 0,
-                r14: 0,
-                r15: 0,
-                user_rip: entry_rip,
-                user_rflags: 0x202, // IF=1 (bit 9) + reserved bit 1
-                user_rsp,
-            };
+            *frame = TrapFrame::empty(entry_rip, user_rsp);
+            0
+        }
+        SyscallAction::ForkChild {
+            child_pid, child_cr3, parent_cr3, child_slot, child_rsp,
+        } => {
+            // SAFETY: Reading `BSP_CPU_LOCAL.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
+            let parent_kernel_rsp =
+                unsafe { core::ptr::read_volatile(&raw const BSP_CPU_LOCAL.saved_kernel_rsp) };
+            let parent_fs_base = get_user_fs_base();
+            let parent_slot = crate::scheduler::active_slot();
+
+            // Set parent's return RAX to child_pid!
+            let mut parent_frame = *frame;
+            parent_frame.rax = child_pid;
+
+            let mut parent_ctx = Box::new(SavedParentContext {
+                fpu_state: FpuState::new(), trap_frame: parent_frame, saved_kernel_rsp: parent_kernel_rsp,
+                parent_cr3, user_fs_base: parent_fs_base, is_fork: true, parent_slot,
+            });
+            parent_ctx.fpu_state.save();
+            PARENT_CONTEXT_STACK.lock().push(parent_ctx);
+
+            // Record child slot switch in scheduler
+            crate::scheduler::set_active_slot(child_slot);
+
+            // Switch hardware CR3 to child's isolated PML4 root
+            crate::mm::switch_cr3(child_cr3);
+
+            // In child, RAX is 0 (child process)
+            frame.rax = 0;
+            if child_rsp != 0 {
+                frame.user_rsp = child_rsp;
+            }
             0
         }
         SyscallAction::ExitUser(exit_code) => {
             let exiting_cr3 = crate::mm::active_cr3();
+            let (exited_pid, _) = crate::scheduler::active_pid_and_tid();
+            crate::scheduler::mark_process_exit(exited_pid, exit_code);
+
             if let Some(parent_ctx) = PARENT_CONTEXT_STACK.lock().pop() {
                 // Restore the parent's isolated `PML4` root in hardware `CR3` (flushes Lower-Half TLB)
                 crate::mm::switch_cr3(parent_ctx.parent_cr3);
@@ -405,8 +423,14 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
                     let _ = crate::mm::destroy_process_vm_space(exiting_cr3);
                 }
 
+                crate::scheduler::set_active_slot(parent_ctx.parent_slot);
+
                 *frame = parent_ctx.trap_frame;
-                frame.rax = (exit_code as i64) as u64;
+                if !parent_ctx.is_fork {
+                    frame.rax = (exit_code as i64) as u64;
+                }
+                // If is_fork is true, frame.rax was already set to child_pid!
+
                 parent_ctx.fpu_state.restore();
                 set_user_fs_base(parent_ctx.user_fs_base);
                 // SAFETY: Restoring the parent process's `saved_kernel_rsp` into `BSP_CPU_LOCAL`.
@@ -469,8 +493,9 @@ pub fn init() {
 
         // 2. Configure IA32_STAR:
         //    Bits 47:32 = 0x0008 (Kernel CS=0x08, SS=0x10)
-        //    Bits 63:48 = 0x0010 (User SS=(0x10+8)|3=0x1B, User CS=(0x10+16)|3=0x23)
-        let star: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
+        //    Bits 63:48 = 0x0010 | 3 = 0x0013 (User SS=(0x10+8)|3=0x1B, User CS=(0x10+16)|3=0x23)
+        //    Crucial: setting bits 49:48 to RPL=3 ensures AMD CPUs calculate SS with RPL=3 on sysretq!
+        let star: u64 = ((0x0010u64 | 3) << 48) | (0x0008u64 << 32);
         wrmsr(MSR_IA32_STAR, star);
 
         // 3. Configure IA32_LSTAR with the address of `__fipsos_syscall_entry` in `trap.s`

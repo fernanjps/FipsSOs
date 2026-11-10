@@ -139,11 +139,13 @@ pub fn init() {
         .expect("Limine no devolvio respuesta para MemoryMapRequest.");
 
     crate::mm::init(hhdm_response.offset(), memmap_response.entries());
+    crate::fb_console::init_ram_backbuffer();
     #[cfg(target_arch = "x86_64")]
     crate::arch::fpu::init();
     crate::arch::init();
     crate::net::init();
     crate::storage::init();
+    crate::bus::xhci::init();
 
     if let Some(initramfs) = initramfs_slice() {
         crate::early_println!(

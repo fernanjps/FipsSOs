@@ -188,19 +188,21 @@ impl LockedHeap {
     }
 
     fn with_lock<R>(&self, f: impl FnOnce(&mut FreeListHeap) -> R) -> R {
-        while self
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        crate::arch::without_interrupts(|| {
+            while self
+                .lock
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
 
-        // SAFETY: Exclusive access is guaranteed by `self.lock`.
-        let result = unsafe { f(&mut *self.heap.get()) };
+            // SAFETY: Exclusive access is guaranteed by `self.lock` and disabled interrupts.
+            let result = unsafe { f(&mut *self.heap.get()) };
 
-        self.lock.store(false, Ordering::Release);
-        result
+            self.lock.store(false, Ordering::Release);
+            result
+        })
     }
 }
 

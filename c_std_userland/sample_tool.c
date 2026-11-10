@@ -15,7 +15,7 @@ static void sys_exit(int code) {
 void _start(void) {
     const char msg[] =
         "\n======================================================\n"
-        "  HOLA DESDE /disk/bin/sample_tool (FipSOs v2.3)\n"
+        "  HOLA DESDE /bin/sample_tool (FipSOs v2.6)\n"
         "  Descargado e instalado dinamicamente con 'pkg'!\n"
         "  Ejecutado inmediatamente sin reiniciar el sistema.\n"
         "======================================================\n\n";

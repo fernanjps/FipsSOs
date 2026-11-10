@@ -67,10 +67,22 @@ pub fn cpu_mhz() -> u32 {
     }
 }
 
-/// Detects package temperature in Celsius via MSR `IA32_THERM_STATUS` (`0x19C`) with QEMU TCG calibration.
+/// Detects package temperature in Celsius via MSR `IA32_THERM_STATUS` (`0x19C`).
+///
+/// Returns 0 (`None`/unsupported) if running on AMD CPUs (`AuthenticAMD`), inside a
+/// hypervisor (VirtualBox / QEMU / KVM), or if MSR 0x19C is invalid or unreadable.
 pub fn cpu_temperature_celsius() -> u32 {
     let topo = super::topology::detect();
-    let ticks = crate::arch::idt::timer_ticks();
+
+    // Check CPUID leaf 1 ECX bit 31 (Hypervisor present)
+    let is_hypervisor = {
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        (leaf1.ecx & (1 << 31)) != 0
+    };
+
+    if is_hypervisor || topo.vendor() == "AuthenticAMD" {
+        return 0;
+    }
 
     // Check CPUID leaf 6 (Thermal and Power Management) bit 0 (DTS)
     let dts_supported = {
@@ -101,8 +113,7 @@ pub fn cpu_temperature_celsius() -> u32 {
         }
     }
 
-    // Calibrated base temperature in QEMU TCG: 42 C with slight dynamic variation
-    41 + ((ticks % 3) as u32)
+    0
 }
 
 /// Takes a consolidated snapshot of hardware sensors and all 4 PCIe/platform drivers.

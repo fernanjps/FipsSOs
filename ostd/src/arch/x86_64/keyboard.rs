@@ -47,6 +47,8 @@ struct KeyboardState {
     len: usize,
     left_shift: bool,
     right_shift: bool,
+    left_alt: bool,
+    right_alt: bool,
     caps_lock: bool,
     extended: bool,
     waker: Option<Waker>,
@@ -61,6 +63,8 @@ impl KeyboardState {
             len: 0,
             left_shift: false,
             right_shift: false,
+            left_alt: false,
+            right_alt: false,
             caps_lock: false,
             extended: false,
             waker: None,
@@ -94,27 +98,58 @@ impl KeyboardState {
 
         if self.extended {
             self.extended = false;
-            // Ignore break codes for extended keys (scancode & 0x80 != 0)
+            // Handle break codes for extended keys
             if (scancode & 0x80) != 0 {
+                let make = scancode & 0x7F;
+                if make == 0x38 {
+                    self.right_alt = false;
+                }
+                return None;
+            }
+            if scancode == 0x38 {
+                self.right_alt = true;
                 return None;
             }
             return match scancode {
-                // Arrow Up -> ANSI "\x1b[A"
-                0x48 => {
-                    let w1 = self.push_byte(0x1B);
-                    let w2 = self.push_byte(b'[');
-                    let w3 = self.push_byte(b'A');
-                    w1.or(w2).or(w3)
+                // Page Up (RePag) -> Scroll console backward 10 lines
+                0x49 => {
+                    crate::fb_console::scroll_history_backward(10);
+                    None
                 }
-                // Arrow Down -> ANSI "\x1b[B"
+                // Page Down (AvPag) -> Scroll console forward 10 lines
+                0x51 => {
+                    crate::fb_console::scroll_history_forward(10);
+                    None
+                }
+                // Arrow Up -> If Shift pressed, scroll backward 10 lines; else ANSI "\x1b[A"
+                0x48 => {
+                    if self.left_shift || self.right_shift {
+                        crate::fb_console::scroll_history_backward(10);
+                        None
+                    } else {
+                        crate::fb_console::reset_scroll();
+                        let w1 = self.push_byte(0x1B);
+                        let w2 = self.push_byte(b'[');
+                        let w3 = self.push_byte(b'A');
+                        w1.or(w2).or(w3)
+                    }
+                }
+                // Arrow Down -> If Shift pressed, scroll forward 10 lines; else ANSI "\x1b[B"
                 0x50 => {
-                    let w1 = self.push_byte(0x1B);
-                    let w2 = self.push_byte(b'[');
-                    let w3 = self.push_byte(b'B');
-                    w1.or(w2).or(w3)
+                    if self.left_shift || self.right_shift {
+                        crate::fb_console::scroll_history_forward(10);
+                        None
+                    } else {
+                        crate::fb_console::reset_scroll();
+                        let w1 = self.push_byte(0x1B);
+                        let w2 = self.push_byte(b'[');
+                        let w3 = self.push_byte(b'B');
+                        w1.or(w2).or(w3)
+                    }
                 }
                 // Arrow Right -> ANSI "\x1b[C"
                 0x4D => {
+                    crate::fb_console::reset_scroll();
                     let w1 = self.push_byte(0x1B);
                     let w2 = self.push_byte(b'[');
                     let w3 = self.push_byte(b'C');
@@ -122,6 +157,7 @@ impl KeyboardState {
                 }
                 // Arrow Left -> ANSI "\x1b[D"
                 0x4B => {
+                    crate::fb_console::reset_scroll();
                     let w1 = self.push_byte(0x1B);
                     let w2 = self.push_byte(b'[');
                     let w3 = self.push_byte(b'D');
@@ -129,6 +165,7 @@ impl KeyboardState {
                 }
                 // Home -> ANSI "\x1b[H"
                 0x47 => {
+                    crate::fb_console::reset_scroll();
                     let w1 = self.push_byte(0x1B);
                     let w2 = self.push_byte(b'[');
                     let w3 = self.push_byte(b'H');
@@ -136,19 +173,29 @@ impl KeyboardState {
                 }
                 // End -> ANSI "\x1b[F"
                 0x4F => {
+                    crate::fb_console::reset_scroll();
                     let w1 = self.push_byte(0x1B);
                     let w2 = self.push_byte(b'[');
                     let w3 = self.push_byte(b'F');
                     w1.or(w2).or(w3)
                 }
                 // Delete -> 0x7F (ASCII DEL)
-                0x53 => self.push_byte(0x7F),
+                0x53 => {
+                    crate::fb_console::reset_scroll();
+                    self.push_byte(0x7F)
+                }
                 // Left Win (0x5B) / Right Win (0x5C) -> 0x11 (DC1 / Win Super key)
                 0x5B | 0x5C => self.push_byte(0x11),
                 // Keypad Enter (0x1C with E0)
-                0x1C => self.push_byte(b'\n'),
+                0x1C => {
+                    crate::fb_console::reset_scroll();
+                    self.push_byte(b'\n')
+                }
                 // Keypad / (0x35 with E0)
-                0x35 => self.push_byte(b'/'),
+                0x35 => {
+                    crate::fb_console::reset_scroll();
+                    self.push_byte(b'/')
+                }
                 _ => None,
             };
         }
@@ -170,12 +217,39 @@ impl KeyboardState {
                 self.right_shift = false;
                 None
             }
+            0x38 => {
+                self.left_alt = true;
+                None
+            }
+            0xB8 => {
+                self.left_alt = false;
+                None
+            }
             0x3A => {
                 self.caps_lock = !self.caps_lock;
                 None
             }
             code if (code & 0x80) != 0 => None, // Key release (break code)
             code => {
+                if self.left_alt || self.right_alt {
+                    // Spanish/Latam keyboard Alt shortcuts:
+                    // Alt + 1 -> '|'
+                    // Alt + 2 -> '>'
+                    // Alt + 3 -> '<'
+                    // Alt + 4 -> '~'
+                    let alt_ch = match code {
+                        0x02 => Some(b'|'),
+                        0x03 => Some(b'>'),
+                        0x04 => Some(b'<'),
+                        0x05 => Some(b'~'),
+                        _ => None,
+                    };
+                    if let Some(c) = alt_ch {
+                        crate::fb_console::reset_scroll();
+                        return self.push_byte(c);
+                    }
+                }
+
                 let idx = code as usize;
                 if idx >= SCANCODE_SET1_NORMAL.len() {
                     return None;
@@ -196,6 +270,7 @@ impl KeyboardState {
                 }
 
                 if ch != 0 {
+                    crate::fb_console::reset_scroll();
                     self.push_byte(ch)
                 } else {
                     None
@@ -255,20 +330,33 @@ pub fn register_waker(waker: Waker) {
     KEYBOARD.lock().waker = Some(waker);
 }
 
-/// Attempts a non-blocking read of a decoded ASCII character from the `IRQ1` keyboard buffer
-/// (or fallback serial console).
+/// Attempts a non-blocking read of a decoded ASCII character from the `IRQ1` keyboard buffer,
+/// PCIe xHCI USB HID keyboard, TCP remote console (port 2222), or fallback serial console.
 pub fn try_read_char() -> Option<u8> {
     if let Some(ch) = KEYBOARD.lock().pop_byte() {
+        return Some(ch);
+    }
+    if let Some(ch) = crate::bus::xhci::pop_hid_byte() {
+        return Some(ch);
+    }
+    crate::net::tcp::poll_remote_console_tcp();
+    if let Some(ch) = crate::net::tcp::pop_remote_console_byte() {
         return Some(ch);
     }
     super::serial::try_read_byte()
 }
 
-/// Immediately extracts a single pending key from the `IRQ1` PS/2 ring buffer, hardware PS/2
-/// controller port (`0x60`), or fallback UART `0x3F8` receiver without waiting for `\n` and
-/// without blocking if no key is pressed (Real-Time Key Polling for 3D engines/games).
+/// Immediately extracts a single pending key from the `IRQ1` PS/2 ring buffer, USB HID xHCI,
+/// TCP remote console, hardware PS/2 controller port (`0x60`), or fallback UART `0x3F8`.
 pub fn try_pop_key_nonblocking() -> Option<u8> {
     if let Some(ch) = KEYBOARD.lock().pop_byte() {
+        return Some(ch);
+    }
+    if let Some(ch) = crate::bus::xhci::pop_hid_byte() {
+        return Some(ch);
+    }
+    crate::net::tcp::poll_remote_console_tcp();
+    if let Some(ch) = crate::net::tcp::pop_remote_console_byte() {
         return Some(ch);
     }
 
@@ -296,17 +384,26 @@ pub fn try_pop_key_nonblocking() -> Option<u8> {
     if let Some(ch) = KEYBOARD.lock().pop_byte() {
         return Some(ch);
     }
+    if let Some(ch) = crate::bus::xhci::pop_hid_byte() {
+        return Some(ch);
+    }
+    crate::net::tcp::poll_remote_console_tcp();
+    if let Some(ch) = crate::net::tcp::pop_remote_console_byte() {
+        return Some(ch);
+    }
 
     super::serial::try_read_byte()
 }
 
 /// Blocks efficiently using `sti; hlt; cli` until an ASCII character arrives from `IRQ1`
-/// (PS/2 Keyboard) or UART COM1.
+/// (PS/2 Keyboard), USB HID xHCI, TCP Remote Console, or UART COM1.
 pub fn read_char_blocking() -> u8 {
     loop {
+        crate::net::poll_network_and_remote_console();
         if let Some(ch) = try_read_char() {
             return ch;
         }
+
         // Idle Power Governor: record idle tick on Core 0 while sleeping in HLT
         crate::scheduler::record_idle_tick(0);
         // SAFETY: Enabling interrupts and halting the CPU core until the next hardware IRQ
@@ -314,6 +411,8 @@ pub fn read_char_blocking() -> u8 {
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
         }
+
+        crate::net::poll_network_and_remote_console();
     }
 }
 

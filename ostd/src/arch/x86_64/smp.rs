@@ -102,8 +102,8 @@ unsafe extern "C" fn ap_startup_continue(cpu_id: usize, lapic_id: u64) -> ! {
     // 3. Inicializa la IDT compartida en este AP
     super::idt::load_idtr();
 
-    // 4. Activa las caracteristicas de hardware de punto flotante y SIMD (FPU, SSE/SSE2)
-    super::fpu::init();
+    // 4. Activa las caracteristicas de hardware de punto flotante y SIMD (FPU, SSE/SSE2, XSAVE/AVX)
+    super::fpu::init_core();
 
     // 5. Configura el Local APIC del nucleo
     init_local_apic();

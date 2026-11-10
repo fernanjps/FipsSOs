@@ -57,8 +57,13 @@ impl SerialPort {
 
     #[inline]
     fn send_raw_byte(&mut self, byte: u8) {
+        let mut timeout: u32 = 1000;
         while !self.is_transmit_empty() {
             core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                return; // Discard byte to prevent freezing on slow/unconnected COM1 in VMs like VirtualBox
+            }
         }
         // SAFETY: Writing to the UART Data Register (base + 0) when THRE is set.
         unsafe {
@@ -90,11 +95,16 @@ pub fn _print(args: fmt::Arguments<'_>) {
     init();
 
     // Acquire simple atomic spinlock to prevent interleaved serial output
+    let mut lock_timeout: u32 = 100_000;
     while SERIAL_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
+        lock_timeout -= 1;
+        if lock_timeout == 0 {
+            return;
+        }
     }
 
     let mut port = SerialPort::new_com1();
