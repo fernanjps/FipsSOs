@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <signal.h>
 
@@ -27,7 +32,7 @@ static void test_sigusr1_handler(int sig) {
 
 int main(int argc, char** argv) {
     printf("\n======================================================\n");
-    printf("[posix_test.c] Linux Standard C Application on FipSOs v3.1\n");
+    printf("[posix_test.c] Linux Standard C Application on FipSOs v4.0\n");
     printf("======================================================\n");
 
     /* 1. Verify System V ABI parameters */
@@ -244,6 +249,81 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("[POSIX Signals] SUCCESS: sigaction() + kill() delivered signal 10 to user handler!\n");
+
+    /* 8. Static Linux Compat: writev() + readv() */
+    int iov_pipe[2] = { -1, -1 };
+    if (pipe(iov_pipe) == 0) {
+        char p1[] = "FipSOs-";
+        char p2[] = "IOVEC";
+        struct iovec wv[2] = {
+            { p1, strlen(p1) },
+            { p2, strlen(p2) }
+        };
+        ssize_t wn = writev(iov_pipe[1], wv, 2);
+        close(iov_pipe[1]);
+        char r1[8] = {0}, r2[8] = {0};
+        struct iovec rv[2] = {
+            { r1, 7 },
+            { r2, 5 }
+        };
+        ssize_t rn = readv(iov_pipe[0], rv, 2);
+        close(iov_pipe[0]);
+        if (wn != 12 || rn != 12 || strcmp(r1, "FipSOs-") != 0 || strcmp(r2, "IOVEC") != 0) {
+            fprintf(stderr, "[Linux Compat] ERROR: writev/readv mismatch wn=%ld rn=%ld\n", (long)wn, (long)rn);
+            return 1;
+        }
+        printf("[Linux Compat] SUCCESS: writev() + readv() vectored I/O passed (%ld bytes)!\n", (long)rn);
+    } else {
+        fprintf(stderr, "[Linux Compat] ERROR: pipe() failed for writev/readv test\n");
+        return 1;
+    }
+
+    /* 9. Static Linux Compat: openat(AT_FDCWD) + newfstatat + fcntl */
+    int etc_fd = openat(AT_FDCWD, "/etc/motd.txt", O_RDONLY, 0);
+    if (etc_fd < 0) {
+        fprintf(stderr, "[Linux Compat] ERROR: openat(AT_FDCWD, /etc/motd.txt) failed\n");
+        return 1;
+    }
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    if (fstat(etc_fd, &st) != 0 || st.st_size <= 0) {
+        fprintf(stderr, "[Linux Compat] ERROR: fstat() on openat fd failed (size=%ld)\n", (long)st.st_size);
+        close(etc_fd);
+        return 1;
+    }
+    int dup_fd = fcntl(etc_fd, F_DUPFD, 10);
+    if (dup_fd < 10) {
+        fprintf(stderr, "[Linux Compat] ERROR: fcntl(F_DUPFD, 10) returned %d\n", dup_fd);
+        close(etc_fd);
+        return 1;
+    }
+    close(dup_fd);
+    close(etc_fd);
+    printf("[Linux Compat] SUCCESS: openat(AT_FDCWD) + fstat(%ld B) + fcntl(F_DUPFD=%d) passed!\n", (long)st.st_size, dup_fd);
+
+    /* 10. Static Linux Compat: getrandom(SYS_getrandom) */
+    unsigned char rnd_buf[16];
+    memset(rnd_buf, 0, sizeof(rnd_buf));
+    long rnd_ret = syscall(SYS_getrandom, rnd_buf, sizeof(rnd_buf), 0);
+    int non_zero = 0;
+    for (int i = 0; i < 16; i++) {
+        if (rnd_buf[i] != 0) non_zero++;
+    }
+    if (rnd_ret != 16 || non_zero == 0) {
+        fprintf(stderr, "[Linux Compat] ERROR: getrandom returned %ld (non_zero=%d)\n", rnd_ret, non_zero);
+        return 1;
+    }
+    printf("[Linux Compat] SUCCESS: getrandom(16 B) returned %ld bytes (%02x %02x %02x %02x...)\n",
+           rnd_ret, rnd_buf[0], rnd_buf[1], rnd_buf[2], rnd_buf[3]);
+
+    /* 11. Static Linux Compat: nanosleep(20ms) */
+    struct timespec req = { 0, 20000000 };
+    struct timespec rem = { 99, 99 };
+    if (nanosleep(&req, &rem) != 0) {
+        fprintf(stderr, "[Linux Compat] ERROR: nanosleep() failed\n");
+        return 1;
+    }
+    printf("[Linux Compat] SUCCESS: nanosleep(20ms) completed cleanly (rem=%ld.%09ld)!\n", (long)rem.tv_sec, rem.tv_nsec);
 
     printf("\n[posix_test.c] SUCCESS: All Linux libc standard routines executed with exit=0!\n");
     printf("======================================================\n\n");

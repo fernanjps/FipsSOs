@@ -285,7 +285,8 @@ pub fn discover_and_configure() {
     let mut rx_buf = vec![0u8; PKT_BUF_SIZE];
     let mut offer: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4], u32)> = None;
 
-    for _ in 0..60_000 {
+    let offer_dl = crate::time::tsc_deadline_ms(250);
+    while !crate::time::tsc_expired(offer_dl) {
         let r = {
             let mut guard = NET_STACK.lock();
             guard.nic.receive_frame(&mut rx_buf)
@@ -340,7 +341,8 @@ pub fn discover_and_configure() {
 
     // 4. Await DHCPACK
     let mut ack: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4], u32)> = None;
-    for _ in 0..60_000 {
+    let ack_dl = crate::time::tsc_deadline_ms(250);
+    while !crate::time::tsc_expired(ack_dl) {
         let r = {
             let mut guard = NET_STACK.lock();
             guard.nic.receive_frame(&mut rx_buf)

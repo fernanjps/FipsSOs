@@ -1,5 +1,15 @@
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static NPU_PRESENT_CACHED: AtomicBool = AtomicBool::new(false);
+static PCI_DEVICES_CACHE: crate::sync::SpinLock<Option<Vec<PciDevice>>> =
+    crate::sync::SpinLock::new(None);
+
+/// Returns whether a PCIe NPU accelerator was detected during bus scan.
+pub fn is_npu_present() -> bool {
+    NPU_PRESENT_CACHED.load(Ordering::Acquire)
+}
 
 /// PCI Configuration Space I/O Ports (Mechanism #1).
 const PCI_CONFIG_ADDRESS: u16 = 0x0CF8;
@@ -107,9 +117,13 @@ impl PciDevice {
     }
 }
 
-/// Internal iterator across active PCI devices on all buses and functions.
-fn for_each_pci_func<F: FnMut(PciDevice) -> bool>(mut callback: F) {
-    for bus in 0u8..=255 {
+/// Enumerates PCIe devices on buses `0..=3` once and caches the result for fast post-boot queries.
+fn cached_pci_devices() -> Vec<PciDevice> {
+    if let Some(ref cached) = *PCI_DEVICES_CACHE.lock() {
+        return cached.clone();
+    }
+    let mut devices = Vec::new();
+    for bus in 0u8..=3 {
         for device in 0u8..32 {
             let vendor_f0 = pci_read_u16(bus, device, 0, 0x00);
             if vendor_f0 == 0xFFFF {
@@ -125,28 +139,30 @@ fn for_each_pci_func<F: FnMut(PciDevice) -> bool>(mut callback: F) {
                 }
                 let device_id = pci_read_u16(bus, device, function, 0x02);
                 let class_rev = pci_read_u32(bus, device, function, 0x08);
-                let revision_id = (class_rev & 0xFF) as u8;
-                let prog_if = ((class_rev >> 8) & 0xFF) as u8;
-                let subclass = ((class_rev >> 16) & 0xFF) as u8;
-                let class_code = ((class_rev >> 24) & 0xFF) as u8;
-                let bar0 = pci_read_u32(bus, device, function, 0x10);
-
-                let dev = PciDevice {
+                devices.push(PciDevice {
                     bus,
                     device,
                     function,
                     vendor_id,
                     device_id,
-                    class_code,
-                    subclass,
-                    prog_if,
-                    revision_id,
-                    bar0,
-                };
-                if callback(dev) {
-                    return;
-                }
+                    class_code: ((class_rev >> 24) & 0xFF) as u8,
+                    subclass: ((class_rev >> 16) & 0xFF) as u8,
+                    prog_if: ((class_rev >> 8) & 0xFF) as u8,
+                    revision_id: (class_rev & 0xFF) as u8,
+                    bar0: pci_read_u32(bus, device, function, 0x10),
+                });
             }
+        }
+    }
+    *PCI_DEVICES_CACHE.lock() = Some(devices.clone());
+    devices
+}
+
+/// Internal iterator across cached PCI devices discovered on buses `0..=3`.
+fn for_each_pci_func<F: FnMut(PciDevice) -> bool>(mut callback: F) {
+    for dev in cached_pci_devices() {
+        if callback(dev) {
+            return;
         }
     }
 }
@@ -182,6 +198,7 @@ pub fn scan_bus() -> Vec<PciDevice> {
                 );
             }
             PciDeviceClass::NpuProcessingAccelerator => {
+                NPU_PRESENT_CACHED.store(true, Ordering::Release);
                 crate::early_println!(
                     "[ostd::bus::pcie] >>> [NPU DETECTADA] {:02x}:{:02x}.{} | Vendor={:#06x} Device={:#06x} | Class={:#04x}:{:#04x} (/dev/accel) BAR0={:#010x}",
                     dev.bus, dev.device, dev.function, dev.vendor_id, dev.device_id, dev.class_code, dev.subclass, dev.bar0
@@ -257,6 +274,26 @@ pub fn enable_bus_master_and_mmio(bus: u8, device: u8, function: u8) -> u16 {
     pci_read_u16(bus, device, function, 0x04)
 }
 
+/// Attempts to program `fallback_mmio` into an unassigned MMIO BAR (`bit 0 == 0 && base == 0`).
+/// Never touches I/O port BARs (`bit 0 == 1`) or unimplemented `0xFFFF_FFFF` BARs.
+fn try_assign_unassigned_mmio_bar(
+    bus: u8,
+    device: u8,
+    function: u8,
+    bar_offset: u8,
+    fallback_mmio: u32,
+) -> Option<u64> {
+    let raw = pci_read_u32(bus, device, function, bar_offset);
+    if raw != 0xFFFF_FFFF && (raw & 0x1) == 0 && (raw & 0xFFFF_FFF0) == 0 {
+        pci_write_u32(bus, device, function, bar_offset, fallback_mmio);
+        let after = pci_read_u32(bus, device, function, bar_offset);
+        if after != 0xFFFF_FFFF && (after & 0x1) == 0 && (after & 0xFFFF_FFF0) != 0 {
+            return Some((after & 0xFFFF_FFF0) as u64);
+        }
+    }
+    None
+}
+
 /// Probes the PCI/PCIe bus for an Intel `e1000` / `e1000e` Gigabit Ethernet controller.
 pub fn probe_e1000_nic() -> Option<(PciDevice, u64, u16)> {
     let mut found = None;
@@ -266,13 +303,11 @@ pub fn probe_e1000_nic() -> Option<(PciDevice, u64, u16)> {
             && dev.subclass == 0x00;
         if is_intel_eth {
             let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
-            let bar0_phys = match read_mmio_bar0(dev.bus, dev.device, dev.function) {
+            let bar0_phys = match read_mmio_bar0(dev.bus, dev.device, dev.function)
+                .or_else(|| try_assign_unassigned_mmio_bar(dev.bus, dev.device, dev.function, 0x10, 0xFEBC_0000))
+            {
                 Some(addr) => addr,
-                None => {
-                    let fallback_mmio: u32 = 0xFEBC_0000;
-                    pci_write_u32(dev.bus, dev.device, dev.function, 0x10, fallback_mmio);
-                    fallback_mmio as u64
-                }
+                None => return false,
             };
             found = Some((dev, bar0_phys, pci_cmd));
             return true;
@@ -290,16 +325,46 @@ pub fn probe_ahci_controller() -> Option<(PciDevice, u64, u16)> {
             || (dev.vendor_id == 0x8086 && dev.device_id == 0x2922);
         if is_ahci {
             let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
-            let bar5_phys = match read_mmio_bar5(dev.bus, dev.device, dev.function) {
+            let bar5_phys = match read_mmio_bar5(dev.bus, dev.device, dev.function)
+                .or_else(|| try_assign_unassigned_mmio_bar(dev.bus, dev.device, dev.function, 0x24, 0xFEB9_0000))
+            {
                 Some(addr) => addr,
-                None => {
-                    let fallback_mmio: u32 = 0xFEB9_0000;
-                    pci_write_u32(dev.bus, dev.device, dev.function, 0x24, fallback_mmio);
-                    fallback_mmio as u64
-                }
+                None => return false,
             };
             found = Some((dev, bar5_phys, pci_cmd));
             return true;
+        }
+        false
+    });
+    found
+}
+
+/// Probes PCIe for an Intel High Definition Audio controller (Class `0x04`, Subclass `0x03`).
+pub fn probe_intel_hda() -> Option<(PciDevice, u64, u16)> {
+    let mut found = None;
+    for_each_pci_func(|dev| {
+        if dev.class_code == 0x04 && dev.subclass == 0x03 {
+            let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
+            if let Some(bar0_phys) = read_mmio_bar0(dev.bus, dev.device, dev.function) {
+                found = Some((dev, bar0_phys, pci_cmd));
+                return true;
+            }
+        }
+        false
+    });
+    found
+}
+
+/// Probes PCIe for a Wireless Network Controller (Class `0x02`, Subclass `0x80`).
+pub fn probe_wifi_controller() -> Option<(PciDevice, u64, u16)> {
+    let mut found = None;
+    for_each_pci_func(|dev| {
+        if dev.class_code == 0x02 && dev.subclass == 0x80 {
+            let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
+            if let Some(bar0_phys) = read_mmio_bar0(dev.bus, dev.device, dev.function) {
+                found = Some((dev, bar0_phys, pci_cmd));
+                return true;
+            }
         }
         false
     });
@@ -313,13 +378,11 @@ pub fn probe_nvme_controller() -> Option<(PciDevice, u64, u16)> {
         let is_nvme = dev.class_code == PCI_CLASS_MASS_STORAGE && dev.subclass == PCI_SUBCLASS_NVME;
         if is_nvme {
             let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
-            let bar0_phys = match read_mmio_bar0(dev.bus, dev.device, dev.function) {
+            let bar0_phys = match read_mmio_bar0(dev.bus, dev.device, dev.function)
+                .or_else(|| try_assign_unassigned_mmio_bar(dev.bus, dev.device, dev.function, 0x10, 0xFEBA_0000))
+            {
                 Some(addr) => addr,
-                None => {
-                    let fallback_mmio: u32 = 0xFEBA_0000;
-                    pci_write_u32(dev.bus, dev.device, dev.function, 0x10, fallback_mmio);
-                    fallback_mmio as u64
-                }
+                None => return false,
             };
             found = Some((dev, bar0_phys, pci_cmd));
             return true;
@@ -344,20 +407,17 @@ pub fn probe_all_usb_controllers() -> alloc::vec::Vec<DiscoveredUsbDevice> {
         let is_usb = dev.class_code == PCI_CLASS_SERIAL_BUS && dev.subclass == PCI_SUBCLASS_USB;
         if is_usb {
             let pci_cmd = enable_bus_master_and_mmio(dev.bus, dev.device, dev.function);
-            let bar0_phys = match read_mmio_bar0(dev.bus, dev.device, dev.function) {
-                Some(addr) => addr,
-                None => {
-                    let fallback_mmio = 0xFEB8_0000u32 + ((dev.device as u32) << 12);
-                    pci_write_u32(dev.bus, dev.device, dev.function, 0x10, fallback_mmio);
-                    fallback_mmio as u64
-                }
-            };
-            list.push(DiscoveredUsbDevice {
-                dev,
-                bar0_phys,
-                pci_cmd,
-                prog_if: dev.prog_if,
-            });
+            let fallback = 0xFEB8_0000u32 + ((dev.device as u32) << 12);
+            if let Some(bar0_phys) = read_mmio_bar0(dev.bus, dev.device, dev.function)
+                .or_else(|| try_assign_unassigned_mmio_bar(dev.bus, dev.device, dev.function, 0x10, fallback))
+            {
+                list.push(DiscoveredUsbDevice {
+                    dev,
+                    bar0_phys,
+                    pci_cmd,
+                    prog_if: dev.prog_if,
+                });
+            }
         }
         false
     });

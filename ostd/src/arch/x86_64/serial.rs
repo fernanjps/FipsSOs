@@ -89,6 +89,11 @@ pub fn init() {
     }
 }
 
+/// Forcibly clears `SERIAL_LOCK` during fatal Ring 0 panic/exception diagnostics.
+pub fn emergency_force_unlock() {
+    SERIAL_LOCK.store(false, Ordering::Release);
+}
+
 /// Internal formatting entrypoint used by `ostd::early_print!` and `ostd::early_println!`.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {

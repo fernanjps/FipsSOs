@@ -130,10 +130,11 @@ core::arch::global_asm!(
     "    mov ds, ax",
     "    mov es, ax",
     ".Lexc_kentry:",
-    "    lea rdi, [rsp + 136]", /* &InterruptStackFrame (rip, cs, rflags, rsp, ss) */
+    "    lea rdi, [rsp + 136]", /* &mut InterruptStackFrame (rip, cs, rflags, rsp, ss) */
     "    mov rsi, [rsp + 128]", /* error_code */
     "    mov rdx, cr2",         /* cr2 */
     "    mov rcx, [rsp + 120]", /* vector */
+    "    mov r8, rsp",          /* &mut SavedGprs */
 
     "    mov rbp, rsp",
     "    and rsp, -16",
@@ -326,6 +327,7 @@ extern "C" {
     fn __isr_keyboard_irq();
     fn __isr_mouse_irq();
     fn __isr_spurious_irq();
+    fn __isr_ap_timer_irq();
 
     fn c_lookup_exception_mnemonic(vector: u64) -> *const core::ffi::c_char;
     fn c_lookup_exception_name(vector: u64) -> *const core::ffi::c_char;
@@ -345,11 +347,16 @@ extern "C" {
 
 #[no_mangle]
 extern "C" fn __rust_exception_dispatcher(
-    frame: &InterruptStackFrame,
+    frame: &mut InterruptStackFrame,
     error_code: u64,
     fault_addr: u64,
     vector: u64,
+    gprs: &mut super::msr::SavedGprs,
 ) {
+    if super::msr::try_recover_msr_gp(vector, frame.code_segment, &mut frame.instruction_pointer, gprs) {
+        return;
+    }
+
     let is_user_fault = (frame.code_segment & 0b11) == 3 || (vector == 14 && (error_code & 4) != 0);
 
     if is_user_fault {
@@ -358,7 +365,10 @@ extern "C" fn __rust_exception_dispatcher(
         super::syscall::recover_from_user_fault(frame.instruction_pointer, fault_addr, sig);
     }
 
-    // Unhandled exception in Ring 0 Kernel Space: format full diagnostic via C decoder and panic
+    // Emergency lock bypass so fatal Ring 0 faults never deadlock on FB_CONSOLE or SERIAL_LOCK.
+    crate::fb_console::emergency_force_unlock();
+    super::serial::emergency_force_unlock();
+
     let mut diag_buf = [0u8; 512];
     let len = unsafe {
         c_format_panic_diagnostic(
@@ -374,10 +384,7 @@ extern "C" fn __rust_exception_dispatcher(
         )
     };
     let diag_str = core::str::from_utf8(&diag_buf[..len]).unwrap_or("[KERNEL PANIC: Diagnostic format error]");
-
     crate::early_println!("\n{}", diag_str);
-    crate::fb_println!("\n{}", diag_str);
-
     let _ = crate::fb_console::with_console(|c| {
         let _ = c.write_str("\n\x1b[1;31m======================================================================\x1b[0m\n");
         let _ = c.write_str("\x1b[1;41;37m [KERNEL PANIC: UNRECOVERABLE RING 0 EXCEPTION]                      \x1b[0m\n");
@@ -386,6 +393,7 @@ extern "C" fn __rust_exception_dispatcher(
         let _ = c.write_str("\x1b[1;31m======================================================================\x1b[0m\n");
         let _ = c.write_str("System halted. Please reboot the machine.\n");
     });
+    crate::fb_console::flush_console();
 
     crate::halt_loop()
 }
@@ -513,6 +521,7 @@ pub fn init() {
             .set_handler(__isr_keyboard_irq as *const () as usize, 0);
         IDT.entries[MOUSE_INTERRUPT_VECTOR]
             .set_handler(__isr_mouse_irq as *const () as usize, 0);
+        IDT.entries[0x40].set_handler(__isr_ap_timer_irq as *const () as usize, 0);
 
         let idtr = DescriptorTablePointer {
             limit: (size_of::<IdtTable>() - 1) as u16,
@@ -524,8 +533,6 @@ pub fn init() {
         super::keyboard::init();
         super::mouse::init();
         init_pic_and_pit();
-        // Trigger a self-test software interrupt on Timer Vector 0x20 to verify IDT dispatch
-        core::arch::asm!("int 0x20", options(preserves_flags));
     }
 
     crate::early_println!(
@@ -561,6 +568,20 @@ pub fn exception_name(vector: u64) -> &'static str {
 #[inline]
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Suspends execution across `ticks_to_sleep` PIT timer ticks using `sti; hlt; cli` so
+/// Ring 0 syscalls (where `SFMASK` clears `IF`) still receive `IRQ0` timer interrupts.
+pub fn sleep_ticks(ticks_to_sleep: u64) {
+    if ticks_to_sleep == 0 {
+        crate::scheduler::on_sys_sched_yield(0, 0);
+        return;
+    }
+    let start = timer_ticks();
+    while timer_ticks().saturating_sub(start) < ticks_to_sleep {
+        crate::scheduler::on_sys_sched_yield(0, 0);
+        crate::scheduler::bsp_idle_hlt();
+    }
 }
 
 /// Reloads the IDTR register on an Application Processor (`AP`).

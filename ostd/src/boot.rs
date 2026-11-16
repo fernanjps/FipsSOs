@@ -1,6 +1,6 @@
 use limine::request::{
     ExecutableFileRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    MpRequest, RequestsEndMarker, RequestsStartMarker,
+    MpRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest,
 };
 use limine::BaseRevision;
 
@@ -43,6 +43,11 @@ static MP_REQUEST: MpRequest = MpRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static EXECUTABLE_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
+
+/// Requests the ACPI RSDP pointer from the Limine bootloader.
+#[used]
+#[link_section = ".limine_requests"]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 /// Marks the end of the Limine boot request section.
 #[used]
@@ -187,4 +192,9 @@ pub fn executable_file_response() -> Option<&'static limine::response::Executabl
 pub fn kernel_cmdline() -> Option<&'static str> {
     let resp = executable_file_response()?;
     resp.file().string().to_str().ok()
+}
+
+/// Returns the ACPI RSDP address provided by Limine, if available.
+pub fn rsdp_addr() -> Option<u64> {
+    RSDP_REQUEST.get_response().map(|r| r.address() as u64)
 }

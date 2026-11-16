@@ -9,7 +9,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_objects::{
-    Channel, KernelObject, Process, ProcessState, Rights, SchedulerRegistry, Thread, Vmo,
+    KernelObject, Process, ProcessState, SchedulerRegistry, Thread,
 };
 use linux_abi::{Elf64Loader, FD_FB0};
 
@@ -70,7 +70,7 @@ pub fn build_compact_fallback_shell_elf64() -> Vec<u8> {
 }
 
 /// Spawns the initial userland environment and executes the Ring 3 transition.
-pub fn launch_system_processes(vmo: Arc<Vmo>, endpoint_b: Arc<Channel>) {
+pub fn launch_system_processes() {
     // 1. Gestor de Sesion: Determinar si se solicito arranque grafico directo ('g' o flag "gui")
     let cmdline_gui = ostd::boot::kernel_cmdline()
         .map(|cmd| cmd.contains("gui") || cmd.contains("desktop"))
@@ -118,14 +118,6 @@ pub fn launch_system_processes(vmo: Arc<Vmo>, endpoint_b: Arc<Channel>) {
         0x0080_3FF0
     };
 
-    let proc_vmo_handle = shell_process.insert_handle(
-        Arc::clone(&vmo) as Arc<dyn KernelObject>,
-        Rights::READ | Rights::WRITE | Rights::MAP,
-    );
-    let proc_chan_handle = shell_process.insert_handle(
-        Arc::clone(&endpoint_b) as Arc<dyn KernelObject>,
-        Rights::READ | Rights::WRITE | Rights::TRANSFER,
-    );
     let shell_thread = Thread::new(
         "shell-main",
         shell_process.koid(),
@@ -133,79 +125,20 @@ pub fn launch_system_processes(vmo: Arc<Vmo>, endpoint_b: Arc<Channel>) {
         initial_rsp,
     );
 
-    let (daemon_entry, daemon_stack_top) = ostd::scheduler::daemon_entry_and_stack_top();
-    let daemon_process = Process::new_kernel("simd-worker", daemon_entry);
-    let daemon_thread = Thread::new(
-        "simd-worker",
-        daemon_process.koid(),
-        daemon_entry,
-        daemon_stack_top,
-    );
-
-    let infer_process = Process::new("/bin/npu_infer.elf", 0x0040_0000);
-    let infer_thread = Thread::new(
-        "rust-elf64",
-        infer_process.koid(),
-        0x0040_0000,
-        0x0080_3FF8,
-    );
-
-    let avatar_cpp_process = Process::new("/bin/avatar_cpp.elf", 0x0040_0000);
-    let avatar_cpp_thread = Thread::new(
-        "cpp20-elf64",
-        avatar_cpp_process.koid(),
-        0x0040_0000,
-        0x0080_3FF8,
-    );
-
-    let desktop_ui_process = Process::new("/bin/desktop_ui.elf", 0x0040_0000);
-    let desktop_ui_thread = Thread::new(
-        "gui-compositor",
-        desktop_ui_process.koid(),
-        0x0040_0000,
-        0x0080_3FF8,
-    );
-
-    SchedulerRegistry::register_boot_entries(
+    SchedulerRegistry::register_primary_process(
         Arc::clone(&shell_process),
         Arc::clone(&shell_thread),
-        Arc::clone(&daemon_process),
-        Arc::clone(&daemon_thread),
-        Arc::clone(&infer_process),
-        Arc::clone(&infer_thread),
-        Arc::clone(&avatar_cpp_process),
-        Arc::clone(&avatar_cpp_thread),
-        Arc::clone(&desktop_ui_process),
-        Arc::clone(&desktop_ui_thread),
     );
 
     dual_println!(
-        "[FipSOs::cr3] PML4 Aislados OK -> Kernel={:#x} | Shell={:#x} | DesktopUI={:#x} | Rust={:#x} | C++20={:#x}",
-        daemon_process.cr3_phys(),
-        shell_process.cr3_phys(),
-        desktop_ui_process.cr3_phys(),
-        infer_process.cr3_phys(),
-        avatar_cpp_process.cr3_phys()
-    );
-    dual_println!(
-        "[FipSOs::process] Proceso \"{}\" ({}) Thread \"{}\" ({}) CR3={:#x} Estado={} | Handles=[{}, {}] | Entry={:#x}",
+        "[FipSOs::process] Proceso \"{}\" ({}) Thread \"{}\" ({}) CR3={:#x} Estado={} | Entry={:#x}",
         shell_process.name(),
         shell_process.koid(),
         shell_thread.name(),
         shell_thread.koid(),
         shell_process.cr3_phys(),
         shell_process.state(),
-        proc_vmo_handle,
-        proc_chan_handle,
         shell_process.entry_point()
-    );
-    dual_println!(
-        "[Thread] Planificador ASM switch.s activo: Shell({}) + Daemon({} @ 16KiB) + DesktopUI({}) + Rust({}) + C++20({})",
-        shell_thread.koid(),
-        daemon_thread.koid(),
-        desktop_ui_thread.koid(),
-        infer_thread.koid(),
-        avatar_cpp_thread.koid()
     );
 
     let exit_code = if is_compiled_elf {

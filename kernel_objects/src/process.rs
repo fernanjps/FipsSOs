@@ -7,6 +7,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use ostd::sync::SpinLock;
 
+use crate::capability::{CapabilityFlags, CAP_ALL};
 use crate::handle::{HandleError, HandleId, HandleTable, Rights};
 use crate::object::{KernelObject, Koid, ObjectType};
 use crate::thread::{Thread, ThreadState};
@@ -42,6 +43,7 @@ pub struct Process {
     name: String,
     entry_point: u64,
     cr3_phys: AtomicU64,
+    capabilities: AtomicU64,
     state: SpinLock<ProcessState>,
     handle_table: SpinLock<HandleTable>,
 }
@@ -56,6 +58,7 @@ impl Process {
             name: String::from(name),
             entry_point,
             cr3_phys: AtomicU64::new(pml4_phys),
+            capabilities: AtomicU64::new(CAP_ALL),
             state: SpinLock::new(ProcessState::Created),
             handle_table: SpinLock::new(HandleTable::new()),
         })
@@ -68,6 +71,7 @@ impl Process {
             name: String::from(name),
             entry_point,
             cr3_phys: AtomicU64::new(ostd::mm::master_kernel_cr3()),
+            capabilities: AtomicU64::new(CAP_ALL),
             state: SpinLock::new(ProcessState::Created),
             handle_table: SpinLock::new(HandleTable::new()),
         })
@@ -126,6 +130,19 @@ impl Process {
     pub fn handle_count(&self) -> usize {
         self.handle_table.lock().len()
     }
+
+    /// Returns the current `CapabilityFlags` bitmask for this process.
+    #[inline]
+    pub fn capabilities(&self) -> CapabilityFlags {
+        CapabilityFlags::from_raw(self.capabilities.load(Ordering::Acquire))
+    }
+
+    /// Irreversibly narrows the process's `CapabilityFlags` bitmask.
+    pub fn narrow_capabilities(&self, mask: u64) -> CapabilityFlags {
+        let updated = self.capabilities().narrow(mask);
+        self.capabilities.store(updated.bits(), Ordering::Release);
+        updated
+    }
 }
 
 impl fmt::Debug for Process {
@@ -175,54 +192,19 @@ static SCHEDULER_REGISTRY: SpinLock<RegistryState> = SpinLock::new(RegistryState
 pub struct SchedulerRegistry;
 
 impl SchedulerRegistry {
-    /// Registers the initial Round-Robin processes and threads (`fipsos-shell.elf`,
-    /// `npu-telemetryd`, `/bin/npu_infer.elf`, `/bin/avatar_cpp.elf`, and `/bin/desktop_ui.elf`)
-    /// and initializes the real 16 KiB ASM context-switch stack (`switch.s`) in `ostd::scheduler`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_boot_entries(
-        shell_proc: Arc<Process>,
-        shell_thread: Arc<Thread>,
-        daemon_proc: Arc<Process>,
-        daemon_thread: Arc<Thread>,
-        infer_rust_proc: Arc<Process>,
-        infer_rust_thread: Arc<Thread>,
-        avatar_cpp_proc: Arc<Process>,
-        avatar_cpp_thread: Arc<Thread>,
-        desktop_ui_proc: Arc<Process>,
-        desktop_ui_thread: Arc<Thread>,
-    ) {
+    /// Registers the initial primary Ring 3 process (`shell_proc`) and thread (`shell_thread`)
+    /// without allocating phantom boot processes.
+    pub fn register_primary_process(shell_proc: Arc<Process>, shell_thread: Arc<Thread>) {
         shell_proc.set_state(ProcessState::RunningRing3);
         shell_thread.set_state(ThreadState::Running);
-
-        daemon_proc.set_state(ProcessState::RunningRing3);
-        daemon_thread.set_state(ThreadState::Ready);
-
-        infer_rust_proc.set_state(ProcessState::Created);
-        infer_rust_thread.set_state(ThreadState::Ready);
-
-        avatar_cpp_proc.set_state(ProcessState::Created);
-        avatar_cpp_thread.set_state(ThreadState::Ready);
-
-        desktop_ui_proc.set_state(ProcessState::Created);
-        desktop_ui_thread.set_state(ThreadState::Ready);
 
         ostd::scheduler::init_slots(
             shell_proc.koid().raw(),
             shell_thread.koid().raw(),
-            daemon_proc.koid().raw(),
-            daemon_thread.koid().raw(),
-            infer_rust_proc.koid().raw(),
-            infer_rust_thread.koid().raw(),
-            avatar_cpp_proc.koid().raw(),
-            avatar_cpp_thread.koid().raw(),
-            desktop_ui_proc.koid().raw(),
-            desktop_ui_thread.koid().raw(),
+            0, 0, 0, 0, 0, 0, 0, 0,
         );
         ostd::scheduler::set_slot_cr3(ostd::scheduler::SLOT_SHELL, shell_proc.cr3_phys());
-        ostd::scheduler::set_slot_cr3(ostd::scheduler::SLOT_DAEMON, daemon_proc.cr3_phys());
-        ostd::scheduler::set_slot_cr3(ostd::scheduler::SLOT_DESKTOP_UI, desktop_ui_proc.cr3_phys());
-        ostd::scheduler::set_slot_cr3(ostd::scheduler::SLOT_CHILD_RUST, infer_rust_proc.cr3_phys());
-        ostd::scheduler::set_slot_cr3(ostd::scheduler::SLOT_CHILD_CPP, avatar_cpp_proc.cr3_phys());
+        ostd::scheduler::set_slot_name(ostd::scheduler::SLOT_SHELL, shell_proc.name());
 
         let mut guard = SCHEDULER_REGISTRY.lock();
         guard.entries.clear();
@@ -231,30 +213,15 @@ impl SchedulerRegistry {
             process: shell_proc,
             thread: shell_thread,
         });
-        guard.entries.push(ProcessThreadRecord {
-            slot: ostd::scheduler::SLOT_DAEMON,
-            process: daemon_proc,
-            thread: daemon_thread,
-        });
-        guard.entries.push(ProcessThreadRecord {
-            slot: ostd::scheduler::SLOT_DESKTOP_UI,
-            process: desktop_ui_proc,
-            thread: desktop_ui_thread,
-        });
-        guard.entries.push(ProcessThreadRecord {
-            slot: ostd::scheduler::SLOT_CHILD_RUST,
-            process: infer_rust_proc,
-            thread: infer_rust_thread,
-        });
-        guard.entries.push(ProcessThreadRecord {
-            slot: ostd::scheduler::SLOT_CHILD_CPP,
-            process: avatar_cpp_proc,
-            thread: avatar_cpp_thread,
-        });
     }
 
     fn resolve_child_slot(path: &str) -> u64 {
-        if path.contains("desktop_ui") {
+        if path.contains("desktop_ui")
+            || path.ends_with("/gui")
+            || path.ends_with("/desktop")
+            || path == "gui"
+            || path == "desktop"
+        {
             ostd::scheduler::SLOT_DESKTOP_UI
         } else if path.contains("avatar_cpp") {
             ostd::scheduler::SLOT_CHILD_CPP
@@ -266,24 +233,36 @@ impl SchedulerRegistry {
     /// Returns (or creates) the dedicated physical `PML4` (`CR3`) assigned to the target child
     /// `Process` before `sys_execve` loads its ELF64 `PT_LOAD` segments and Ring 3 stack.
     pub fn prepare_child_cr3(path: &str) -> Result<u64, &'static str> {
-        let target_slot = Self::resolve_child_slot(path);
-        let master_cr3 = ostd::mm::master_kernel_cr3();
+        let preferred_slot = Self::resolve_child_slot(path);
+        let cr3 = ostd::mm::create_process_pml4()?;
+        let Some(assigned_slot) = ostd::scheduler::acquire_exec_slot(preferred_slot, cr3) else {
+            let _ = ostd::mm::destroy_process_vm_space(cr3);
+            return Err("No hay slots de ejecucion libres en SchedulerRegistry");
+        };
+
         let guard = SCHEDULER_REGISTRY.lock();
         for rec in &guard.entries {
-            if rec.slot == target_slot {
-                let mut cr3 = rec.process.cr3_phys();
-                if cr3 == 0 || cr3 == master_cr3 {
-                    cr3 = ostd::mm::create_process_pml4()?;
-                    rec.process.set_cr3_phys(cr3);
-                }
-                ostd::scheduler::set_slot_cr3(target_slot, cr3);
-                return Ok(cr3);
+            if rec.slot == assigned_slot && matches!(rec.process.state(), ProcessState::Created) {
+                rec.process.set_cr3_phys(cr3);
+            }
+        }
+        ostd::scheduler::set_slot_cr3(assigned_slot, cr3);
+        Ok(cr3)
+    }
+
+    /// Clears a cached child `CR3` if `sys_execve` fails after `prepare_child_cr3` frees it.
+    pub fn abort_child_cr3(path: &str, freed_cr3: u64) {
+        let preferred_slot = Self::resolve_child_slot(path);
+        let slot = ostd::scheduler::slot_for_cr3(freed_cr3).unwrap_or(preferred_slot);
+        let guard = SCHEDULER_REGISTRY.lock();
+        for rec in &guard.entries {
+            if rec.slot == slot && rec.process.cr3_phys() == freed_cr3 {
+                rec.process.set_cr3_phys(0);
             }
         }
         drop(guard);
-        let cr3 = ostd::mm::create_process_pml4()?;
-        ostd::scheduler::set_slot_cr3(target_slot, cr3);
-        Ok(cr3)
+        ostd::scheduler::abort_exec_slot(freed_cr3);
+        ostd::scheduler::set_slot_cr3(slot, 0);
     }
 
     /// Transitions the target child `Process` and `Thread` (`/bin/desktop_ui.elf`,
@@ -292,7 +271,9 @@ impl SchedulerRegistry {
     pub fn begin_child_exec(path: &str, entry_rip: u64, user_rsp: u64) -> (Koid, Koid) {
         let pre_snap = ostd::scheduler::snapshot();
         let parent_slot = pre_snap.active_slot;
-        let target_slot = Self::resolve_child_slot(path);
+        let preferred_slot = Self::resolve_child_slot(path);
+        let target_slot =
+            ostd::scheduler::slot_for_cr3(ostd::mm::active_cr3()).unwrap_or(preferred_slot);
 
         let guard = SCHEDULER_REGISTRY.lock();
         let mut child_pid = Koid::allocate();
@@ -313,6 +294,7 @@ impl SchedulerRegistry {
         }
         drop(guard);
 
+        ostd::scheduler::sync_slot_identity(target_slot, child_pid.raw(), path);
         ostd::scheduler::on_enter_child(
             target_slot,
             child_pid.raw(),
@@ -434,33 +416,79 @@ impl SchedulerRegistry {
             snap.total_voluntary_yields
         );
 
-        for rec in &guard.entries {
+        let occupied = ostd::scheduler::occupied_slots_snapshot();
+        for s in &occupied {
+            let (ticks, switches, rip, rsp, cr3) = match s.slot {
+                ostd::scheduler::SLOT_SHELL => (
+                    snap.shell_ticks,
+                    snap.shell_switches,
+                    snap.shell_rip,
+                    snap.shell_rsp,
+                    snap.shell_cr3,
+                ),
+                ostd::scheduler::SLOT_DAEMON => (
+                    snap.daemon_ticks,
+                    snap.daemon_switches,
+                    snap.daemon_rip,
+                    snap.daemon_rsp,
+                    snap.daemon_cr3,
+                ),
+                ostd::scheduler::SLOT_DESKTOP_UI => (
+                    snap.desktop_ui_ticks,
+                    snap.desktop_ui_switches,
+                    snap.desktop_ui_rip,
+                    snap.desktop_ui_rsp,
+                    snap.desktop_ui_cr3,
+                ),
+                ostd::scheduler::SLOT_CHILD_RUST => (
+                    snap.child_rust_ticks,
+                    snap.child_rust_switches,
+                    snap.child_rust_rip,
+                    snap.child_rust_rsp,
+                    snap.child_rust_cr3,
+                ),
+                ostd::scheduler::SLOT_CHILD_CPP => (
+                    snap.child_cpp_ticks,
+                    snap.child_cpp_switches,
+                    snap.child_cpp_rip,
+                    snap.child_cpp_rsp,
+                    snap.child_cpp_cr3,
+                ),
+                ostd::scheduler::SLOT_BG_DOWNLOADER => (
+                    snap.bg_downloader_ticks,
+                    snap.bg_downloader_switches,
+                    s.rip,
+                    s.rsp,
+                    s.cr3_phys,
+                ),
+                _ => (s.ticks, s.switches, s.rip, s.rsp, s.cr3_phys),
+            };
             ostd::early_println!(
-                "  PID={:<9} | TID={:<9} | {:<20} ({:<14}) | {:<10} | CR3={:#010x} | RIP={:#018x} | RSP={:#x} | Ticks={:>4} | Sw={:>3}",
-                rec.process.koid(),
-                rec.thread.koid(),
-                rec.process.name(),
-                rec.thread.name(),
-                rec.thread.state(),
-                rec.process.cr3_phys(),
-                rec.thread.last_rip(),
-                rec.thread.user_rsp(),
-                rec.thread.cpu_ticks(),
-                rec.thread.context_switches()
+                "  SLOT={:<2} | PID={:<6} | PPID={:<6} | {:<18} | {:?} | CR3={:#010x} | RIP={:#018x} | RSP={:#x} | Ticks={:>4} | Sw={:>3}",
+                s.slot,
+                s.pid,
+                s.ppid,
+                s.name_str(),
+                s.state,
+                cr3,
+                rip,
+                rsp,
+                ticks,
+                switches
             );
             ostd::fb_println!(
-                "  PID={:<9} | {:<19} | {:<9} | CR3={:#x} | RIP={:#x} | Ticks={} | Sw={}",
-                rec.process.koid(),
-                rec.process.name(),
-                rec.thread.state(),
-                rec.process.cr3_phys(),
-                rec.thread.last_rip(),
-                rec.thread.cpu_ticks(),
-                rec.thread.context_switches()
+                "  SLOT={:<2} | PID={:<6} | {:<16} | {:?} | CR3={:#x} | Ticks={} | Sw={}",
+                s.slot,
+                s.pid,
+                s.name_str(),
+                s.state,
+                cr3,
+                ticks,
+                switches
             );
         }
 
-        guard.entries.len()
+        occupied.len()
     }
 
     /// Terminates or signals a process by PID or scheduler slot using `ostd::scheduler::kill_task`.
@@ -495,6 +523,7 @@ impl SchedulerRegistry {
                 name: String::from(name),
                 entry_point: 0x0040_0000,
                 cr3_phys: AtomicU64::new(ostd::mm::master_kernel_cr3()),
+                capabilities: AtomicU64::new(CAP_ALL),
                 state: SpinLock::new(ProcessState::RunningRing3),
                 handle_table: SpinLock::new(HandleTable::new()),
             });

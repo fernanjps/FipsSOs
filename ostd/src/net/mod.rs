@@ -6,6 +6,7 @@ pub mod dhcp;
 pub mod e1000;
 pub mod remote_shell;
 pub mod tcp_client;
+pub mod tcp_server;
 
 pub use arp_ipv4::*;
 pub use remote_shell::*;
@@ -15,6 +16,7 @@ pub use tcp_client::*;
 pub mod tcp {
     pub use super::remote_shell::*;
     pub use super::tcp_client::*;
+    pub use super::tcp_server::*;
 }
 
 use alloc::format;
@@ -48,9 +50,20 @@ pub fn set_assigned_ip(ip: [u8; 4], gw: [u8; 4]) {
     *CURRENT_GATEWAY_IPV4.lock() = gw;
 }
 
-/// Lightweight non-blocking network polling helper invoked on timer ticks and keyboard waits.
+static BG_NET_POLL_HOOK: SpinLock<Option<fn()>> = SpinLock::new(None);
+
+/// Registers a non-blocking background network service poll callback invoked from the AP worker loop (outside IRQ).
+pub fn register_bg_net_poll_hook(cb: fn()) {
+    *BG_NET_POLL_HOOK.lock() = Some(cb);
+}
+
+/// Lightweight non-blocking network polling helper invoked from the AP worker loop (outside IRQ).
 pub fn poll_network_and_remote_console() {
     remote_shell::poll_remote_console_tcp();
+    let hook = BG_NET_POLL_HOOK.try_lock().and_then(|g| *g);
+    if let Some(cb) = hook {
+        cb();
+    }
 }
 
 static ICMP_SEQ: AtomicU16 = AtomicU16::new(1);
@@ -133,10 +146,16 @@ impl NetPingResult {
     }
 }
 
-/// Initializes the PCIe Intel `e1000`/`e1000e` controller.
+/// Initializes the PCIe Intel `e1000`/`e1000e` controller and negotiates DHCP lease if present.
 pub fn init() {
-    let mut guard = NET_STACK.lock();
-    guard.nic.init_hardware();
+    let linked = {
+        let mut guard = NET_STACK.lock();
+        guard.nic.init_hardware();
+        guard.nic.is_present()
+    };
+    if linked {
+        dhcp::discover_and_configure();
+    }
 }
 
 /// Returns a telemetry snapshot of the hardware NIC registers.
@@ -158,8 +177,8 @@ pub fn ping_gateway() -> NetPingResult {
     let gw_ip = current_gateway_ipv4();
 
     // 1. Resolve Gateway MAC via ARP Request if not yet cached
-    let gw_mac = match guard.gateway_mac {
-        Some(mac) => mac,
+    let (arp_ok, gw_mac) = match guard.gateway_mac {
+        Some(mac) => (true, mac),
         None => {
             let arp_frame = build_arp_frame(
                 src_mac,
@@ -173,7 +192,8 @@ pub fn ping_gateway() -> NetPingResult {
 
             let mut rx_buf = [0u8; PKT_BUF_SIZE];
             let mut resolved = None;
-            for _ in 0..10_000 {
+            let arp_dl = crate::time::tsc_deadline_ms(150);
+            while !crate::time::tsc_expired(arp_dl) {
                 if let Some(len) = guard.nic.receive_frame(&mut rx_buf) {
                     guard.live_wire_rx = true;
                     if let Some(mac) =
@@ -186,11 +206,12 @@ pub fn ping_gateway() -> NetPingResult {
                 core::hint::spin_loop();
             }
 
-            let final_mac = resolved.unwrap_or(FALLBACK_SLIRP_GW_MAC);
-            guard.gateway_mac = Some(final_mac);
-            final_mac
+            (resolved.is_some(), resolved.unwrap_or(FALLBACK_SLIRP_GW_MAC))
         }
     };
+    if arp_ok {
+        guard.gateway_mac = Some(gw_mac);
+    }
 
     // 2. Transmit ICMP Echo Request
     let seq = ICMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -212,7 +233,8 @@ pub fn ping_gateway() -> NetPingResult {
     // 3. Receive wire frames until ICMP Echo Reply arrives
     let mut rx_buf = [0u8; PKT_BUF_SIZE];
     let mut success = false;
-    for _ in 0..50_000 {
+    let icmp_dl = crate::time::tsc_deadline_ms(250);
+    while !crate::time::tsc_expired(icmp_dl) {
         if let Some(len) = guard.nic.receive_frame(&mut rx_buf) {
             guard.live_wire_rx = true;
             if let Some(updated_gw) =
@@ -230,7 +252,8 @@ pub fn ping_gateway() -> NetPingResult {
 
     let end_tsc = read_tsc();
     let elapsed_tsc = end_tsc.saturating_sub(start_tsc);
-    let rtt_us = (elapsed_tsc / 2000).min(65535) as u16; // ~2.0 GHz baseline clock
+    let cycles_per_us = (crate::time::tsc_hz() / 1_000_000).max(1);
+    let rtt_us = (elapsed_tsc / cycles_per_us).min(65535) as u16;
     guard.last_rtt_us = rtt_us;
 
     let snap = guard.nic.snapshot();
@@ -239,7 +262,7 @@ pub fn ping_gateway() -> NetPingResult {
         local_ip: src_ip,
         gateway_ip: gw_ip,
         gateway_mac: gw_mac,
-        arp_resolved: true,
+        arp_resolved: arp_ok,
         icmp_reply_ok: success,
         live_wire_rx: guard.live_wire_rx,
         seq,
@@ -247,135 +270,92 @@ pub fn ping_gateway() -> NetPingResult {
     }
 }
 
+fn parse_ipv4_literal(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    for part in s.split('.') {
+        if idx >= 4 {
+            return None;
+        }
+        octets[idx] = part.parse::<u8>().ok()?;
+        idx += 1;
+    }
+    if idx == 4 { Some(octets) } else { None }
+}
+
 /// Downloads a software package or remote note via HTTP GET over `/dev/net/eth0`.
 pub fn http_fetch_package(resource_path: &str) -> (NetPingResult, Vec<u8>) {
-    let url = format!("http://10.0.2.2{}", resource_path);
+    let gw = current_gateway_ipv4();
+    let url = format!("http://{}.{}.{}.{}{}", gw[0], gw[1], gw[2], gw[3], resource_path);
     http_fetch_url(&url)
 }
 
-/// Performs an HTTP GET request to `http://<ip>/<path>` over standard QEMU SLIRP.
+/// Performs an HTTP/1.0 GET request over a real RFC 793 TCP 3-way handshake connection.
 pub fn http_fetch_url(uri: &str) -> (NetPingResult, Vec<u8>) {
     let ping_info = ping_gateway();
     if !ping_info.icmp_reply_ok {
         return (ping_info, Vec::new());
     }
 
-    let (gw_mac, src_mac, my_ip, gw_ip) = {
-        let guard = NET_STACK.lock();
-        (
-            guard.gateway_mac.unwrap_or(FALLBACK_SLIRP_GW_MAC),
-            guard.nic.mac_address(),
-            current_ipv4(),
-            current_gateway_ipv4(),
-        )
-    };
-
-    let path = if let Some(pos) = uri.find("://") {
+    let gw_ip = current_gateway_ipv4();
+    let (authority, path) = if let Some(pos) = uri.find("://") {
         let after_scheme = &uri[pos + 3..];
         if let Some(slash) = after_scheme.find('/') {
-            &after_scheme[slash..]
+            (&after_scheme[..slash], &after_scheme[slash..])
         } else {
-            "/"
+            (after_scheme, "/")
         }
     } else {
-        uri
+        ("", uri)
     };
 
-    let ephemeral_port = 49152u16.wrapping_add((read_tsc() & 0x3FFF) as u16);
-    let http_port = 80u16;
+    let (host_str, dst_port) = if let Some(colon) = authority.rfind(':') {
+        let p = authority[colon + 1..].parse::<u16>().unwrap_or(80);
+        (&authority[..colon], p)
+    } else {
+        (authority, 80u16)
+    };
 
-    // 1. Send TCP SYN
-    let mut syn_buf = [0u8; 128];
-    let syn_len = build_tcp_syn_frame(
-        src_mac,
-        gw_mac,
-        my_ip,
-        gw_ip,
-        ephemeral_port,
-        http_port,
-        &mut syn_buf,
+    let dst_ip = parse_ipv4_literal(host_str).unwrap_or(gw_ip);
+    let host_header = if host_str.is_empty() {
+        format!("{}.{}.{}.{}", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])
+    } else {
+        alloc::string::String::from(host_str)
+    };
+
+    let Ok(sock_id) = tcp_client::create_socket() else {
+        return (ping_info, Vec::new());
+    };
+    if tcp_client::connect(sock_id, dst_ip, dst_port).is_err() {
+        let _ = tcp_client::close(sock_id);
+        return (ping_info, Vec::new());
+    }
+
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: FipSOs/6.1\r\nConnection: close\r\n\r\n",
+        path, host_header
     );
-
-    {
-        let mut guard = NET_STACK.lock();
-        let _ = guard.nic.transmit_frame(&syn_buf[..syn_len]);
+    if tcp_client::send(sock_id, req.as_bytes()).is_err() {
+        let _ = tcp_client::close(sock_id);
+        return (ping_info, Vec::new());
     }
 
-    // 2. Poll for HTTP Response payload
-    let mut rx_buf = [0u8; PKT_BUF_SIZE];
-    let mut live_http_body = None;
-
-    for _ in 0..60_000 {
-        let mut guard = NET_STACK.lock();
-        if let Some(len) = guard.nic.receive_frame(&mut rx_buf) {
-            guard.live_wire_rx = true;
-            let _ = inspect_and_answer_arp(&mut guard.nic, &rx_buf[..len], src_mac);
-            if let Some(body) = extract_http_payload(&rx_buf[..len]) {
-                live_http_body = Some(body);
-                break;
-            }
+    let mut raw_resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    for _ in 0..64 {
+        match tcp_client::recv(sock_id, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw_resp.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
         }
-        drop(guard);
-        core::hint::spin_loop();
     }
+    let _ = tcp_client::close(sock_id);
 
-    let (final_info, payload) = match live_http_body {
-        Some(bytes) => (ping_info, bytes),
-        None => {
-            // Synthetic local package payload fallback
-            let fallback_data = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 64\r\n\r\n[FipSOs::pkg] Paquete verificado en vivo sobre NIC e1000e: \"{}\"\n",
-                path
-            );
-            (ping_info, fallback_data.into_bytes())
-        }
-    };
-
-    (final_info, payload)
-}
-
-fn build_tcp_syn_frame(
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-    out: &mut [u8],
-) -> usize {
-    let tcp_len = 20usize;
-    let ip_total_len = 20 + tcp_len;
-    let total_len = 14 + ip_total_len;
-
-    out[0..6].copy_from_slice(&dst_mac);
-    out[6..12].copy_from_slice(&src_mac);
-    out[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-
-    let ip = &mut out[14..34];
-    ip.fill(0);
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
-    ip[4..6].copy_from_slice(&0x1337u16.to_be_bytes());
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    ip[8] = 64;
-    ip[9] = IPPROTO_TCP;
-    ip[12..16].copy_from_slice(&src_ip);
-    ip[16..20].copy_from_slice(&dst_ip);
-    let ip_csum = internet_checksum(ip);
-    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    let tcp = &mut out[34..total_len];
-    tcp.fill(0);
-    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
-    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    tcp[4..8].copy_from_slice(&0xF195_0001u32.to_be_bytes()); // Initial Sequence Number
-    tcp[12] = 5 << 4; // Data Offset = 5 (20B)
-    tcp[13] = 0x02; // SYN flag
-    tcp[14..16].copy_from_slice(&8192u16.to_be_bytes()); // Window
-    let tcp_csum = l4_pseudo_checksum(src_ip, dst_ip, IPPROTO_TCP, tcp);
-    tcp[16..18].copy_from_slice(&tcp_csum.to_be_bytes());
-
-    total_len
+    if let Some(sep) = raw_resp.windows(4).position(|w| w == b"\r\n\r\n") {
+        (ping_info, raw_resp[sep + 4..].to_vec())
+    } else {
+        (ping_info, raw_resp)
+    }
 }
 
 #[inline]

@@ -7,16 +7,26 @@ use ostd::sync::SpinLock;
 
 use crate::vfs::{cleanup_process_fds, CapabilityVfs};
 
+pub mod compat;
+pub mod dispatch_ext;
+pub mod fd_ops;
 pub mod fs;
 pub mod fs_dir;
+pub mod httpd_bg;
 pub mod mem;
 pub mod net_sys;
 pub mod process;
+pub mod sandbox;
+pub mod sysinfo;
 
+pub use compat::*;
+pub use fd_ops::*;
 pub use fs::*;
 pub use mem::*;
 pub use net_sys::*;
 pub use process::*;
+pub use sandbox::*;
+pub use sysinfo::*;
 
 /// Linux `x86_64` canonical syscall numbers.
 pub const SYS_READ: u64 = 0;
@@ -35,6 +45,7 @@ pub const SYS_BRK: u64 = 12;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_IOCTL: u64 = 16;
+pub const SYS_READV: u64 = 19;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_ACCESS: u64 = 21;
 pub const SYS_PIPE: u64 = 22;
@@ -70,6 +81,9 @@ pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FSYNC: u64 = 74;
+pub const SYS_FDATASYNC: u64 = 75;
+pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_FTRUNCATE: u64 = 77;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
@@ -77,6 +91,8 @@ pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_UNLINK: u64 = 87;
 pub const SYS_READLINK: u64 = 89;
+pub const SYS_CHMOD: u64 = 90;
+pub const SYS_FCHMOD: u64 = 91;
 pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
@@ -92,11 +108,14 @@ pub const SYS_SCHED_GETAFFINITY: u64 = 204;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
+pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_OPENAT: u64 = 257;
 pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_FCHMODAT: u64 = 268;
 pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_PSELECT6: u64 = 270;
 pub const SYS_PPOLL: u64 = 271;
@@ -109,43 +128,32 @@ pub const SYS_RSEQ: u64 = 334;
 
 pub const TCGETS: u64 = 0x5401;
 pub const TIOCGWINSZ: u64 = 0x5413;
-pub const ARCH_SET_FS: u64 = 0x1002;
-pub const ARCH_GET_FS: u64 = 0x1003;
 
 
 pub(crate) static GLOBAL_VFS: SpinLock<CapabilityVfs> = SpinLock::new(CapabilityVfs::new());
-pub(crate) static CURRENT_WORKING_DIR: SpinLock<alloc::string::String> = SpinLock::new(alloc::string::String::new());
-pub(crate) static ACTIVE_PROGRAM_NAME: SpinLock<alloc::string::String> = SpinLock::new(alloc::string::String::new());
 
 pub(crate) fn get_cwd() -> alloc::string::String {
-    let cwd = CURRENT_WORKING_DIR.lock();
-    if cwd.is_empty() {
-        alloc::string::String::from("/")
-    } else {
-        cwd.clone()
-    }
+    crate::vfs::get_process_cwd(ostd::scheduler::active_slot())
 }
 
-
 pub(crate) fn set_cwd(new_path: alloc::string::String) {
-    let mut cwd = CURRENT_WORKING_DIR.lock();
-    *cwd = new_path;
+    crate::vfs::set_process_cwd(ostd::scheduler::active_slot(), new_path);
+}
+
+pub(crate) fn get_active_program_name() -> alloc::string::String {
+    crate::vfs::get_process_program_name(ostd::scheduler::active_slot())
+}
+
+pub(crate) fn set_active_program_name(name: alloc::string::String) {
+    crate::vfs::set_process_program_name(ostd::scheduler::active_slot(), name);
 }
 
 
 pub(crate) fn resolve_path(path: &str) -> alloc::string::String {
-    let p = path.trim();
-    if p.starts_with('/') {
-        crate::vfs::normalize_path(p)
-    } else {
-        let cwd = get_cwd();
-        let full = if cwd == "/" {
-            alloc::format!("/{}", p)
-        } else {
-            alloc::format!("{}/{}", cwd, p)
-        };
-        crate::vfs::normalize_path(&full)
-    }
+    let slot = ostd::scheduler::active_slot();
+    let root = crate::vfs::get_process_root(slot);
+    let cwd = get_cwd();
+    crate::container::resolve_for_process(&root, &cwd, path)
 }
 
 
@@ -181,159 +189,58 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
     ostd::scheduler::record_syscall_frame(frame.user_rip, frame.user_rsp);
 
     match syscall_num {
-        SYS_READ => {
-            let ret = sys_read(arg0, arg1, arg2 as usize);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_WRITE => {
-            let ret = sys_write(arg0, arg1, arg2 as usize);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_OPEN => {
-            let ret = sys_open(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_CLOSE => {
-            let ret = sys_close(arg0);
-            SyscallAction::Continue(ret as u64)
-        }
+        SYS_READ => SyscallAction::Continue(sys_read(arg0, arg1, arg2 as usize) as u64),
+        SYS_WRITE => SyscallAction::Continue(sys_write(arg0, arg1, arg2 as usize) as u64),
+        SYS_OPEN => SyscallAction::Continue(sys_open(arg0, arg1, arg2) as u64),
+        SYS_CLOSE => SyscallAction::Continue(sys_close(arg0) as u64),
         SYS_STAT | SYS_LSTAT => {
-            let ret = sys_newfstatat(-100 /* AT_FDCWD */, arg0, arg1, 0);
-            SyscallAction::Continue(ret as u64)
+            SyscallAction::Continue(sys_newfstatat(-100 /* AT_FDCWD */, arg0, arg1, 0) as u64)
         }
-        SYS_FSTAT => {
-            let ret = sys_fstat(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_LSEEK => {
-            let ret = sys_lseek(arg0, arg1 as i64, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
+        SYS_FSTAT => SyscallAction::Continue(sys_fstat(arg0, arg1) as u64),
+        SYS_LSEEK => SyscallAction::Continue(sys_lseek(arg0, arg1 as i64, arg2) as u64),
         SYS_MMAP => {
-            let ret = sys_mmap(arg0, arg1 as usize, arg2, arg3, arg4, arg5 as usize);
-            SyscallAction::Continue(ret as u64)
+            SyscallAction::Continue(sys_mmap(arg0, arg1 as usize, arg2, arg3, arg4, arg5 as usize) as u64)
         }
         SYS_MPROTECT => {
-            // W^X memory protection is enforced by page tables; returning 0 allows glibc/musl RELRO init
-            SyscallAction::Continue(0)
+            SyscallAction::Continue(sys_mprotect(arg0, arg1 as usize, arg2) as u64)
         }
-        SYS_MUNMAP => {
-            let ret = sys_munmap(arg0, arg1 as usize);
+        SYS_MUNMAP => SyscallAction::Continue(sys_munmap(arg0, arg1 as usize) as u64),
+        SYS_BRK => SyscallAction::Continue(sys_brk(arg0) as u64),
+        SYS_IOCTL => SyscallAction::Continue(sys_ioctl(arg0, arg1, arg2) as u64),
+        SYS_READV => SyscallAction::Continue(sys_readv(arg0, arg1, arg2) as u64),
+        SYS_WRITEV => SyscallAction::Continue(sys_writev(arg0, arg1, arg2) as u64),
+        SYS_ACCESS => SyscallAction::Continue(sys_access(arg0, arg1) as u64),
+        SYS_FACCESSAT => SyscallAction::Continue(sys_access(arg1, arg2) as u64),
+        SYS_PIPE | SYS_PIPE2 => SyscallAction::Continue(sys_pipe2(arg0, arg1) as u64),
+        SYS_DUP => SyscallAction::Continue(sys_dup(arg0) as u64),
+        SYS_DUP2 | SYS_DUP3 => SyscallAction::Continue(sys_dup2(arg0, arg1) as u64),
+        SYS_FSYNC | SYS_FDATASYNC => {
+            let ret = fs_dir::sys_fsync(arg0);
             SyscallAction::Continue(ret as u64)
         }
-        SYS_BRK => {
-            let ret = sys_brk(arg0);
+        SYS_TRUNCATE => {
+            let ret = fs_dir::sys_truncate(arg0, arg1 as i64);
             SyscallAction::Continue(ret as u64)
-        }
-        SYS_RT_SIGACTION => {
-            let ret = sys_rt_sigaction(arg0, arg1, arg2, arg3);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_RT_SIGPROCMASK => {
-            let ret = sys_rt_sigprocmask(arg0 as i32, arg1, arg2, arg3);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_IOCTL => {
-            let ret = sys_ioctl(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_WRITEV => {
-            let ret = sys_writev(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_ACCESS => {
-            let ret = sys_access(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_FACCESSAT => {
-            let ret = sys_access(arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_PIPE | SYS_PIPE2 => {
-            let ret = sys_pipe2(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_DUP => {
-            let ret = sys_dup(arg0);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_DUP2 | SYS_DUP3 => {
-            let ret = sys_dup2(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_NANOSLEEP => {
-            let ret = sys_nanosleep(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SETITIMER => {
-            // wget / alarm timer configuration
-            SyscallAction::Continue(0)
-        }
-        SYS_POLL | SYS_PPOLL => {
-            let ret = sys_poll(arg0, arg1, arg2 as i64);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SELECT | SYS_PSELECT6 => {
-            let ret = sys_select(arg0, arg1, arg2, arg3);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SENDFILE => {
-            let ret = sys_sendfile(arg0, arg1, arg2, arg3 as usize);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SOCKET => {
-            let ret = sys_socket(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_CONNECT => {
-            let ret = sys_connect(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_ACCEPT => {
-            SyscallAction::Continue((-22i64) as u64) // -EINVAL
-        }
-        SYS_SENDTO => {
-            let ret = sys_sendto(arg0, arg1, arg2 as usize, arg3, arg4, arg5);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_RECVFROM => {
-            let ret = sys_recvfrom(arg0, arg1, arg2 as usize, arg3, arg4, arg5);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SENDMSG => {
-            let ret = sys_writev(arg0, arg1, 1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_RECVMSG => {
-            SyscallAction::Continue(0)
-        }
-        SYS_SHUTDOWN => {
-            SyscallAction::Continue(0)
-        }
-        SYS_BIND | SYS_LISTEN => {
-            SyscallAction::Continue(0)
-        }
-        SYS_GETSOCKNAME => {
-            let ret = sys_getsockname(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_GETPEERNAME => {
-            let ret = sys_getpeername(arg0, arg1, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SETSOCKOPT => {
-            let ret = sys_setsockopt(arg0, arg1, arg2, arg3, arg4);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_GETSOCKOPT => {
-            let ret = sys_getsockopt(arg0, arg1, arg2, arg3, arg4);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SOCKETPAIR => {
-            SyscallAction::Continue(0)
         }
         SYS_FTRUNCATE => {
-            SyscallAction::Continue(0)
+            let ret = fs_dir::sys_ftruncate(arg0, arg1 as i64);
+            SyscallAction::Continue(ret as u64)
+        }
+        SYS_CHMOD => {
+            let ret = fs_dir::sys_chmod(arg0);
+            SyscallAction::Continue(ret as u64)
+        }
+        SYS_FCHMOD => {
+            let ret = fs_dir::sys_fchmod(arg0);
+            SyscallAction::Continue(ret as u64)
+        }
+        SYS_FCHMODAT => {
+            let ret = fs_dir::sys_fchmodat(arg0 as i64, arg1);
+            SyscallAction::Continue(ret as u64)
+        }
+        SYS_UNLINKAT => {
+            let ret = fs_dir::sys_unlinkat(arg0 as i64, arg1, arg2);
+            SyscallAction::Continue(ret as u64)
         }
         SYS_WAIT4 => {
             let ret = sys_wait4(arg0 as i64, arg1, arg2, arg3);
@@ -359,23 +266,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
             let ret = sys_rmdir(arg0);
             SyscallAction::Continue(ret as u64)
         }
-        SYS_GETUID | SYS_GETEUID => SyscallAction::Continue(0),
-        SYS_GETGID | SYS_GETEGID => SyscallAction::Continue(0),
-        SYS_GETPPID => {
-            let ppid = ostd::scheduler::get_active_ppid();
-            SyscallAction::Continue(ppid)
-        }
-        SYS_GETPGRP => SyscallAction::Continue(1),
         SYS_GETDENTS64 => {
             let ret = sys_getdents64(arg0, arg1, arg2 as usize);
             SyscallAction::Continue(ret as u64)
         }
         SYS_SCHED_YIELD => {
             let ret = sys_sched_yield(frame.user_rip, frame.user_rsp);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SCHED_GETAFFINITY => {
-            let ret = sys_sched_getaffinity(arg0 as i64, arg1 as usize, arg2);
             SyscallAction::Continue(ret as u64)
         }
         SYS_GETPID => {
@@ -385,17 +281,25 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
         SYS_KILL => {
             let (active_pid, _) = ostd::scheduler::active_pid_and_tid();
             let ret = sys_kill(arg0, arg1);
-            if arg0 == active_pid && (arg1 == 9 || (arg1 == 15 && ostd::scheduler::get_sigaction(active_pid, 15) == 0)) {
+            if arg0 == active_pid
+                && (arg1 == 9
+                    || (arg1 == 15 && ostd::scheduler::get_sigaction(active_pid, 15) == 0))
+            {
                 let slot = ostd::scheduler::active_slot();
-                cleanup_process_fds(slot);
-                SyscallAction::ExitUser(128 + arg1 as i32)
+                let exit_code = 128 + arg1 as i32;
+                let exiting_cid = crate::vfs::get_process_container_id(slot);
+                fs::finish_orphan_nodes(cleanup_process_fds(slot));
+                crate::container::on_process_exit(exiting_cid, exit_code);
+                if has_parent_context() {
+                    ostd::scheduler::reset_slot_capabilities(slot);
+                    if !ostd::arch::syscall::is_parent_fork() {
+                        SchedulerRegistry::finish_child_exec(exit_code, frame.user_rip);
+                    }
+                }
+                SyscallAction::ExitUser(exit_code)
             } else {
                 SyscallAction::Continue(ret as u64)
             }
-        }
-        SYS_UNAME => {
-            let ret = sys_uname(arg0);
-            SyscallAction::Continue(ret as u64)
         }
         SYS_FCNTL => {
             let ret = sys_fcntl(arg0, arg1, arg2);
@@ -409,37 +313,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
             let ret = sys_readlink(arg0, arg1, arg2 as usize);
             SyscallAction::Continue(ret as u64)
         }
-        SYS_SYSINFO => {
-            let ret = sys_sysinfo(arg0);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_STATFS => {
-            let ret = sys_statfs(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_FSTATFS => {
-            let ret = sys_fstatfs(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_ARCH_PRCTL => {
-            let ret = sys_arch_prctl(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_REBOOT => {
-            let ret = sys_reboot(arg0, arg1, arg2, arg3);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_SET_TID_ADDRESS => {
-            let ret = sys_set_tid_address(arg0);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_CLOCK_GETTIME => {
-            let ret = sys_clock_gettime(arg0, arg1);
-            SyscallAction::Continue(ret as u64)
-        }
         SYS_OPENAT => {
-            // Modern Linux libc fopen/openat(dirfd, path, flags, mode)
-            let ret = sys_open(arg1, arg2, arg3);
+            // Linux openat(dirfd, pathname, flags, mode)
+            let ret = sys_openat(arg0 as i64, arg1, arg2, arg3);
             SyscallAction::Continue(ret as u64)
         }
         SYS_NEWFSTATAT => {
@@ -450,20 +326,6 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
             let ret = sys_readlink(arg1, arg2, arg3 as usize);
             SyscallAction::Continue(ret as u64)
         }
-        SYS_SET_ROBUST_LIST => {
-            SyscallAction::Continue(0)
-        }
-        SYS_PRLIMIT64 => {
-            SyscallAction::Continue(0)
-        }
-        SYS_GETRANDOM => {
-            let ret = sys_getrandom(arg0, arg1 as usize, arg2);
-            SyscallAction::Continue(ret as u64)
-        }
-        SYS_RSEQ => {
-            // Reporting -ENOSYS allows glibc and musl to fall back to atomic ops
-            SyscallAction::Continue((-38i64) as u64)
-        }
         SYS_CLONE => sys_clone(arg0, arg1, frame),
         SYS_FORK | SYS_VFORK => sys_fork(frame),
         SYS_EXECVE => sys_execve(arg0, arg1, arg2),
@@ -471,10 +333,11 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
             let exit_code = arg0 as i32;
             let exiting_cr3 = active_cr3();
             let exiting_slot = ostd::scheduler::active_slot();
-            cleanup_process_fds(exiting_slot);
+            let exiting_cid = crate::vfs::get_process_container_id(exiting_slot);
+            fs::finish_orphan_nodes(cleanup_process_fds(exiting_slot));
+            crate::container::on_process_exit(exiting_cid, exit_code);
             if ostd::arch::syscall::is_parent_fork() {
                 let child_pid = ostd::scheduler::active_pid();
-                ostd::scheduler::mark_process_exit(child_pid, exit_code);
                 let target_parent_cr3 = peek_parent_cr3().unwrap_or_else(master_kernel_cr3);
                 ostd::early_println!(
                     "[linux_abi::syscall] sys_exit/exit_group(status={}) desde proceso forkeado PID={} (RIP={:#x}) | Restaurando CR3: {:#x} -> {:#x}",
@@ -484,26 +347,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
                     exiting_cr3,
                     target_parent_cr3
                 );
-                ostd::fb_println!(
-                    "[linux_abi::syscall] sys_exit(status={}) fork PID={} (RIP={:#x}) | CR3 {:#x} -> {:#x}",
-                    exit_code,
-                    child_pid,
-                    frame.user_rip,
-                    exiting_cr3,
-                    target_parent_cr3
-                );
             } else if has_parent_context() {
                 let target_parent_cr3 = peek_parent_cr3().unwrap_or_else(master_kernel_cr3);
+                ostd::scheduler::reset_slot_capabilities(exiting_slot);
                 SchedulerRegistry::finish_child_exec(exit_code, frame.user_rip);
                 ostd::early_println!(
                     "[linux_abi::syscall] sys_exit/exit_group(status={}) desde proceso hijo en Anillo 3 (RIP={:#x}) | Restaurando CR3: {:#x} -> {:#x}",
-                    exit_code,
-                    frame.user_rip,
-                    exiting_cr3,
-                    target_parent_cr3
-                );
-                ostd::fb_println!(
-                    "[linux_abi::syscall] sys_exit(status={}) hijo (RIP={:#x}) | CR3 {:#x} -> {:#x}",
                     exit_code,
                     frame.user_rip,
                     exiting_cr3,
@@ -518,17 +367,15 @@ pub fn dispatch_syscall(frame: &mut TrapFrame) -> SyscallAction {
                     exiting_cr3,
                     kernel_cr3
                 );
-                ostd::fb_println!(
-                    "[linux_abi::syscall] sys_exit(status={}) Anillo 3 (RIP={:#x}) | CR3 {:#x} -> {:#x}",
-                    exit_code,
-                    frame.user_rip,
-                    exiting_cr3,
-                    kernel_cr3
-                );
             }
             SyscallAction::ExitUser(exit_code)
         }
         unknown => {
+            if let Some(action) =
+                dispatch_ext::dispatch_ext_syscall(unknown, arg0, arg1, arg2, arg3, arg4, arg5)
+            {
+                return action;
+            }
             ostd::early_println!(
                 "[linux_abi::syscall] Syscall no soportada: num={} @ RIP={:#x}",
                 unknown,

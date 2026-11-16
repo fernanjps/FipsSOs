@@ -6,8 +6,12 @@
 
 extern crate alloc;
 
+pub mod container;
+pub mod container_ctl;
 pub mod diskfs;
 pub mod elf;
+pub mod fat32;
+pub mod net_80211;
 pub mod syscall;
 pub mod tarfs;
 pub mod vfs;
@@ -18,14 +22,17 @@ pub use diskfs::{
 };
 pub use elf::{Elf64Loader, ElfError, LoadedElf64};
 pub use syscall::{
-    dispatch_syscall, init, read_all_by_path, read_device_vmo, sys_arch_prctl, sys_brk, sys_close, sys_execve,
-    sys_fstat, sys_getpid, sys_getrandom, sys_ioctl, sys_kill, sys_lseek, sys_mmap, sys_newfstatat,
-    sys_open, sys_read, sys_readlink, sys_sched_yield, sys_set_tid_address, sys_uname, sys_unlink,
-    sys_write, sys_writev, ARCH_GET_FS, ARCH_SET_FS, SYS_ARCH_PRCTL, SYS_BRK, SYS_CLOCK_GETTIME,
-    SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP, SYS_FSTAT, SYS_GETPID, SYS_GETRANDOM,
-    SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MMAP, SYS_MPROTECT, SYS_NEWFSTATAT, SYS_OPEN, SYS_OPENAT,
-    SYS_PRLIMIT64, SYS_READ, SYS_READLINK, SYS_READLINKAT, SYS_REBOOT, SYS_RSEQ, SYS_SCHED_YIELD, SYS_SET_ROBUST_LIST,
-    SYS_SET_TID_ADDRESS, SYS_UNAME, SYS_UNLINK, SYS_WRITE, SYS_WRITEV, TCGETS, TIOCGWINSZ,
+    dispatch_syscall, init, read_all_by_path, read_device_vmo, sys_arch_prctl, sys_brk,
+    sys_clock_nanosleep, sys_close, sys_execve, sys_fcntl, sys_fstat, sys_getpid, sys_getrandom,
+    sys_ioctl, sys_kill, sys_lseek, sys_mmap, sys_nanosleep, sys_newfstatat, sys_open,
+    sys_openat, sys_prlimit64, sys_read, sys_readlink, sys_readv, sys_sched_yield,
+    sys_set_robust_list, sys_set_tid_address, sys_uname, sys_unlink, sys_write, sys_writev,
+    ARCH_GET_FS, ARCH_SET_FS, SYS_ARCH_PRCTL, SYS_BRK, SYS_CLOCK_GETTIME, SYS_CLOCK_NANOSLEEP,
+    SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP, SYS_FCNTL, SYS_FSTAT, SYS_GETPID,
+    SYS_GETRANDOM, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MMAP, SYS_MPROTECT, SYS_NANOSLEEP,
+    SYS_NEWFSTATAT, SYS_OPEN, SYS_OPENAT, SYS_PRLIMIT64, SYS_READ, SYS_READLINK, SYS_READLINKAT,
+    SYS_READV, SYS_REBOOT, SYS_RSEQ, SYS_SCHED_YIELD, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
+    SYS_UNAME, SYS_UNLINK, SYS_WRITE, SYS_WRITEV, TCGETS, TIOCGWINSZ,
 };
 pub use tarfs::{TarFileEntry, TarFs, TAR_BLOCK_SIZE};
 pub use vfs::{

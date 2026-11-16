@@ -30,11 +30,11 @@ pub const USER_STACK_DEFAULT_BASE: VirtAddr = 0x0000_0000_0080_0000;
 /// Canonical Lower-Half User Space dynamic Heap base for `sys_brk` (`0x0200_0000`).
 pub const USER_HEAP_BASE_VADDR: VirtAddr = 0x0000_0000_0200_0000;
 
-/// Maximum Lower-Half User Space dynamic Heap ceiling (`0x0800_0000`, 96 MiB).
-pub const USER_HEAP_MAX_VADDR: VirtAddr = 0x0000_0000_0800_0000;
+/// Maximum Lower-Half User Space dynamic Heap ceiling (`0x4000_0000`, ~992 MiB dynamic brk arena).
+pub const USER_HEAP_MAX_VADDR: VirtAddr = 0x0000_0000_4000_0000;
 
-/// Canonical Lower-Half User Space base for `sys_mmap` Zero-Copy VMO mappings (`0x1000_0000`).
-pub const USER_MMAP_BASE_VADDR: VirtAddr = 0x0000_0000_1000_0000;
+/// Canonical Lower-Half User Space base for `sys_mmap` Zero-Copy VMO mappings (`0x4000_0000`).
+pub const USER_MMAP_BASE_VADDR: VirtAddr = 0x0000_0000_4000_0000;
 
 /// Upper bound of canonical Lower-Half User Space (`0x0000_7FFF_FFFF_FFFF`).
 pub const USER_SPACE_MAX_VADDR: VirtAddr = 0x0000_7FFF_FFFF_FFFF;
@@ -328,6 +328,20 @@ pub fn expand_user_brk(new_addr: VirtAddr) -> VirtAddr {
     }
 
     new_addr
+}
+
+/// Returns how many additional 4 KiB pages `expand_user_brk(new_addr)` will map.
+pub fn brk_additional_pages(new_addr: VirtAddr) -> usize {
+    if new_addr == 0 || !(USER_HEAP_BASE_VADDR..=USER_HEAP_MAX_VADDR).contains(&new_addr) {
+        return 0;
+    }
+    let mapped_end = with_active_vm_space(|space| space.mapped_brk_end);
+    if new_addr > mapped_end {
+        let required_end = (new_addr + (PAGE_SIZE as u64) - 1) & !((PAGE_SIZE as u64) - 1);
+        ((required_end - mapped_end) as usize) / PAGE_SIZE
+    } else {
+        0
+    }
 }
 
 

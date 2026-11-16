@@ -69,7 +69,7 @@ impl TarFs {
         Self::append_ustar_file(
             &mut archive,
             "etc/motd.txt",
-            b"[MOTD] Bienvenido a FipSOs v0.7 (Zircon Framekernel + Linux ABI + TarFs Initramfs + NPU Zero-Copy)\n",
+            b"[MOTD] Bienvenido a FipSOs v4.3 Framekernel (x86_64 SMP | FAT32 | Lua | TCC | xHCI HID | NVMe)\n",
         );
         Self::append_ustar_file(
             &mut archive,

@@ -4,11 +4,15 @@ use super::super::{
     frame::allocate_frame,
     phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE,
 };
+use crate::sync::SpinLock;
+
+static MMIO_MAP_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Maps a PCIe device MMIO physical aperture `[phys_addr, phys_addr + size_bytes)` into the
 /// Higher-Half Direct Map (`phys_to_virt(phys_addr)`) of the active `CR3` page table with
 /// `PTE_PRESENT | PTE_WRITABLE | PTE_PWT | PTE_PCD (NO_CACHE) | PTE_NX_BIT`.
 pub fn map_kernel_mmio(phys_addr: PhysAddr, size_bytes: usize) -> VirtAddr {
+    let _mmio_guard = MMIO_MAP_LOCK.lock();
     const PTE_PRESENT: u64 = 1 << 0;
     const PTE_WRITABLE: u64 = 1 << 1;
     const PTE_PWT: u64 = 1 << 3;

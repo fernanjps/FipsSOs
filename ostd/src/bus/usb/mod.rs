@@ -1,4 +1,5 @@
 pub const LEGACY_USB_MMIO_SIZE: usize = 0x1000;
+pub const USB_CTRL_TIMEOUT_MS: u64 = 100;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -10,6 +11,7 @@ use crate::sync::SpinLock;
 pub mod ehci;
 pub mod ohci;
 pub mod xhci;
+pub mod xhci_hid;
 
 pub use ehci::*;
 pub use ohci::*;
@@ -68,6 +70,9 @@ pub(crate) static USB_CONTROLLERS: SpinLock<Vec<UsbControllerTelemetry>> = SpinL
 
 /// Probes and initializes all standard USB controllers on the PCIe bus (xHCI, EHCI, OHCI).
 pub fn init() {
+    if USB_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
     let controllers = probe_all_usb_controllers();
     if controllers.is_empty() {
         crate::early_println!("[ostd::bus::usb] No se detectaron controladoras USB en bus PCIe.");
@@ -104,13 +109,26 @@ pub fn snapshot_all() -> Vec<UsbControllerTelemetry> {
 }
 
 pub fn summary_text() -> String {
+    // Snapshot xHCI outside USB_CONTROLLERS lock so fallback scan inside xhci::snapshot() never self-deadlocks.
+    let xhci_tel = xhci::snapshot();
     let controllers = USB_CONTROLLERS.lock();
     if controllers.is_empty() {
         return String::from("Ninguna");
     }
     let mut parts = Vec::new();
     for c in controllers.iter() {
-        parts.push(format!("{}: {} puertos ({} activos)", c.kind.as_str(), c.max_ports, c.active_ports));
+        if matches!(c.kind, UsbControllerKind::Xhci) && (xhci_tel.hid_keyboards > 0 || xhci_tel.hid_mice > 0) {
+            parts.push(format!(
+                "{}: {} puertos ({} activos, HID Kbd={} Mouse={})",
+                c.kind.as_str(),
+                c.max_ports,
+                c.active_ports,
+                xhci_tel.hid_keyboards,
+                xhci_tel.hid_mice
+            ));
+        } else {
+            parts.push(format!("{}: {} puertos ({} activos)", c.kind.as_str(), c.max_ports, c.active_ports));
+        }
     }
     parts.join(", ")
 }

@@ -21,10 +21,11 @@ ostd::kernel_main!(fipsos_main);
 fn fipsos_main() {
     ostd::boot::init();
     linux_abi::init();
+    ostd::scheduler::mark_boot_complete();
     dual_println!(
-        "[FipSOs] Framekernel FipSOs v3.4 activo (SMP Multicore | Multi-USB xHCI/EHCI/OHCI | DHCP | TCP Remote :2222 | SATA AHCI)."
+        "[FipSOs] Framekernel FipSOs v6.3 activo (SMP | Containers | FAT32 LBA 2048 | Clean GUI)."
     );
 
-    let (vmo, endpoint_b) = boot_checks::run_boot_diagnostics();
-    process_launch::launch_system_processes(vmo, endpoint_b);
+    boot_checks::run_boot_diagnostics();
+    process_launch::launch_system_processes();
 }

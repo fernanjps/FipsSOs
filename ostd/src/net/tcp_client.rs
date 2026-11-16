@@ -10,9 +10,7 @@ use super::arp_ipv4::{
     build_arp_frame, build_tcp_frame, inspect_and_answer_arp, parse_tcp_frame,
 };
 use super::e1000::PKT_BUF_SIZE;
-use super::{
-    read_tsc, FALLBACK_SLIRP_GW_MAC, GATEWAY_IPV4, LOCAL_IPV4, NET_STACK,
-};
+use super::{read_tsc, FALLBACK_SLIRP_GW_MAC, NET_STACK};
 
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -57,10 +55,11 @@ pub fn create_socket() -> Result<u64, i64> {
         local_port = 49152;
     }
 
+    let local_ip = super::current_ipv4();
     let conn = TcpConnection {
         socket_id: sock_id,
         state: TcpState::Closed,
-        local_ip: LOCAL_IPV4,
+        local_ip,
         local_port,
         remote_ip: [0; 4],
         remote_port: 0,
@@ -77,8 +76,42 @@ pub fn create_socket() -> Result<u64, i64> {
     Ok(sock_id)
 }
 
+/// Registers an already-established inbound TCP connection (accepted by `tcp_server`) in `TCP_REGISTRY`.
+pub fn insert_accepted_connection(
+    local_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_mac: [u8; 6],
+    remote_mac: [u8; 6],
+    snd_nxt: u32,
+    rcv_nxt: u32,
+    initial_rx: &[u8],
+) -> u64 {
+    let sock_id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+    let mut rx_buffer = VecDeque::with_capacity(8192);
+    rx_buffer.extend(initial_rx.iter().copied());
+    let conn = TcpConnection {
+        socket_id: sock_id,
+        state: TcpState::Established,
+        local_ip: super::current_ipv4(),
+        local_port,
+        remote_ip,
+        remote_port,
+        local_mac,
+        remote_mac,
+        snd_nxt,
+        rcv_nxt,
+        rx_buffer,
+        is_eof: false,
+    };
+    TCP_REGISTRY.lock().insert(sock_id, conn);
+    sock_id
+}
+
 /// Executes the RFC 793 Three-Way Handshake (SYN -> SYN-ACK -> ACK) over `e1000e` DMA.
 pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(), i64> {
+    let local_ip = super::current_ipv4();
+    let gw_ip = super::current_gateway_ipv4();
     let (src_mac, dst_mac) = {
         let mut guard = NET_STACK.lock();
         let src = guard.nic.mac_address();
@@ -87,16 +120,17 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
             None => {
                 let arp_req = build_arp_frame(
                     src,
-                    LOCAL_IPV4,
+                    local_ip,
                     [0xFF; 6],
                     [0x00; 6],
-                    GATEWAY_IPV4,
+                    gw_ip,
                     1,
                 );
                 let _ = guard.nic.transmit_frame(&arp_req);
                 let mut rx_buf = [0u8; PKT_BUF_SIZE];
                 let mut resolved = None;
-                for _ in 0..10_000 {
+                let arp_dl = crate::time::tsc_deadline_ms(150);
+                while !crate::time::tsc_expired(arp_dl) {
                     if let Some(len) = guard.nic.receive_frame(&mut rx_buf) {
                         if let Some(gw_mac) = inspect_and_answer_arp(&mut guard.nic, &rx_buf[..len], src) {
                             guard.gateway_mac = Some(gw_mac);
@@ -115,6 +149,7 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
     let (local_port, isn) = {
         let mut registry = TCP_REGISTRY.lock();
         let conn = registry.get_mut(&socket_id).ok_or(-9i64)?; // -EBADF
+        conn.local_ip = local_ip;
         conn.remote_ip = remote_ip;
         conn.remote_port = remote_port;
         conn.local_mac = src_mac;
@@ -126,7 +161,8 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
     };
 
     crate::early_println!(
-        "[ostd::net::tcp] Iniciando Three-Way Handshake TCP: 10.0.2.15:{} -> {}.{}.{}.{}:{} (ISN={:#x})",
+        "[ostd::net::tcp] Iniciando Three-Way Handshake TCP: {}.{}.{}.{}:{} -> {}.{}.{}.{}:{} (ISN={:#x})",
+        local_ip[0], local_ip[1], local_ip[2], local_ip[3],
         local_port,
         remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3],
         remote_port,
@@ -138,7 +174,7 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
     let syn_len = build_tcp_frame(
         src_mac,
         dst_mac,
-        LOCAL_IPV4,
+        local_ip,
         remote_ip,
         local_port,
         remote_port,
@@ -168,7 +204,8 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
     let mut server_seq: u32 = 0;
     let mut rx_buf = [0u8; PKT_BUF_SIZE];
 
-    for _ in 0..400_000 {
+    let syn_dl = crate::time::tsc_deadline_ms(300);
+    while !crate::time::tsc_expired(syn_dl) {
         let maybe_frame = {
             let mut guard = NET_STACK.lock();
             guard.nic.receive_frame(&mut rx_buf)
@@ -183,7 +220,7 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
 
             if let Some((tcp_hdr, _payload)) = parse_tcp_frame(
                 frame,
-                LOCAL_IPV4,
+                local_ip,
                 remote_ip,
                 local_port,
                 remote_port,
@@ -229,7 +266,7 @@ pub fn connect(socket_id: u64, remote_ip: [u8; 4], remote_port: u16) -> Result<(
     let ack_len = build_tcp_frame(
         src_mac,
         dst_mac,
-        LOCAL_IPV4,
+        local_ip,
         remote_ip,
         local_port,
         remote_port,
@@ -268,6 +305,7 @@ pub fn send(socket_id: u64, data: &[u8]) -> Result<usize, i64> {
 
     let src_mac = conn.local_mac;
     let dst_mac = conn.remote_mac;
+    let local_ip = if conn.local_ip == [0; 4] { super::current_ipv4() } else { conn.local_ip };
     let local_port = conn.local_port;
     let remote_ip = conn.remote_ip;
     let remote_port = conn.remote_port;
@@ -280,7 +318,7 @@ pub fn send(socket_id: u64, data: &[u8]) -> Result<usize, i64> {
         let wire_len = build_tcp_frame(
             src_mac,
             dst_mac,
-            LOCAL_IPV4,
+            local_ip,
             remote_ip,
             local_port,
             remote_port,
@@ -337,13 +375,15 @@ pub fn recv(socket_id: u64, out: &mut [u8]) -> Result<usize, i64> {
 
     let local_mac = conn.local_mac;
     let remote_mac = conn.remote_mac;
+    let local_ip = if conn.local_ip == [0; 4] { super::current_ipv4() } else { conn.local_ip };
     let remote_ip = conn.remote_ip;
     let local_port = conn.local_port;
     let remote_port = conn.remote_port;
 
     let mut rx_buf = [0u8; PKT_BUF_SIZE];
 
-    for _ in 0..500_000 {
+    let rx_dl = crate::time::tsc_deadline_ms(300);
+    while !crate::time::tsc_expired(rx_dl) {
         let maybe_frame = {
             let mut guard = NET_STACK.lock();
             guard.nic.receive_frame(&mut rx_buf)
@@ -358,7 +398,7 @@ pub fn recv(socket_id: u64, out: &mut [u8]) -> Result<usize, i64> {
 
             if let Some((tcp_hdr, payload)) = parse_tcp_frame(
                 frame,
-                LOCAL_IPV4,
+                local_ip,
                 remote_ip,
                 local_port,
                 remote_port,
@@ -389,7 +429,7 @@ pub fn recv(socket_id: u64, out: &mut [u8]) -> Result<usize, i64> {
                     let ack_len = build_tcp_frame(
                         local_mac,
                         remote_mac,
-                        LOCAL_IPV4,
+                        local_ip,
                         remote_ip,
                         local_port,
                         remote_port,
@@ -429,14 +469,16 @@ pub fn recv(socket_id: u64, out: &mut [u8]) -> Result<usize, i64> {
 
 /// Closes the TCP socket connection with an orderly `FIN+ACK` exchange.
 pub fn close(socket_id: u64) -> Result<(), i64> {
+    super::tcp_server::unbind(socket_id);
     let mut registry = TCP_REGISTRY.lock();
     if let Some(mut conn) = registry.remove(&socket_id) {
         if conn.state == TcpState::Established || conn.state == TcpState::CloseWait {
+            let local_ip = if conn.local_ip == [0; 4] { super::current_ipv4() } else { conn.local_ip };
             let mut fin_frame = [0u8; 64];
             let fin_len = build_tcp_frame(
                 conn.local_mac,
                 conn.remote_mac,
-                LOCAL_IPV4,
+                local_ip,
                 conn.remote_ip,
                 conn.local_port,
                 conn.remote_port,

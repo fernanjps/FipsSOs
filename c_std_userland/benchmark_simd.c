@@ -1,6 +1,6 @@
 /*
  * FipSOs - benchmark_simd.c
- * Freestanding SSE2 FP32 SIMD Vector Benchmark Utility for FipSOs v2.4
+ * Freestanding SSE2 FP32 SIMD Vector Benchmark Utility for FipSOs v4.0
  */
 
 static void sys_exit(int code) {

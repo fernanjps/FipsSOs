@@ -5,7 +5,43 @@ use super::slots::{SLOT_SHELL, SLOT_DAEMON, SLOT_BG_DOWNLOADER};
 use super::{BG_DOWNLOADER_ACTIVE, BG_DOWNLOADER_TICKS, BG_DOWNLOADER_SWITCHES};
 
 /// Maximum number of supported CPU cores.
-pub const MAX_CPUS: usize = 4;
+pub const MAX_CPUS: usize = 16;
+
+static BOOT_COMPLETE: AtomicBool = AtomicBool::new(false);
+pub(crate) static BSP_IDLE_HLT: AtomicBool = AtomicBool::new(false);
+
+/// Suspends Core 0 (BSP) cleanly in `hlt` while marking BSP as idle for live core accounting.
+pub fn bsp_idle_hlt() {
+    BSP_IDLE_HLT.store(true, Ordering::Release);
+    // SAFETY: Brief interrupt window around `hlt` wakes on IRQ0/IRQ1/IRQ12, then restores CLI.
+    unsafe {
+        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+    }
+    BSP_IDLE_HLT.store(false, Ordering::Release);
+}
+
+/// Records a hardware LAPIC periodic timer IRQ on the Application Processor (`AP`).
+pub fn on_ap_timer_irq(lapic_id: u32) {
+    for c in CPU_CONTROLS.iter().skip(1) {
+        if c.online.load(Ordering::Acquire) && c.lapic_id.load(Ordering::Acquire) as u32 == lapic_id {
+            c.irq_ticks.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    if MAX_CPUS > 1 && CPU_CONTROLS[1].online.load(Ordering::Acquire) {
+        CPU_CONTROLS[1].irq_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Signals that BSP initialization and VFS mounting are complete so APs can enable interrupts.
+pub fn mark_boot_complete() {
+    BOOT_COMPLETE.store(true, Ordering::Release);
+}
+
+/// Returns whether initial kernel boot and VFS mounting have completed.
+pub fn is_boot_complete() -> bool {
+    BOOT_COMPLETE.load(Ordering::Acquire)
+}
 
 /// Per-core control block (`CpuControlBlock` / `CpuLocal`).
 pub struct CpuControlBlock {
@@ -41,6 +77,18 @@ pub(crate) static CPU_CONTROLS: [CpuControlBlock; MAX_CPUS] = [
     CpuControlBlock::new(1),
     CpuControlBlock::new(2),
     CpuControlBlock::new(3),
+    CpuControlBlock::new(4),
+    CpuControlBlock::new(5),
+    CpuControlBlock::new(6),
+    CpuControlBlock::new(7),
+    CpuControlBlock::new(8),
+    CpuControlBlock::new(9),
+    CpuControlBlock::new(10),
+    CpuControlBlock::new(11),
+    CpuControlBlock::new(12),
+    CpuControlBlock::new(13),
+    CpuControlBlock::new(14),
+    CpuControlBlock::new(15),
 ];
 
 /// Registers the Bootstrap Processor (BSP) in the CPU control table.
@@ -100,14 +148,21 @@ pub fn ap_worker_loop(cpu_id: u32) -> ! {
     let idx = (cpu_id as usize).min(MAX_CPUS - 1);
     let block = &CPU_CONTROLS[idx];
 
+    // Keep interrupts disabled (IF=0) on APs until BSP completes boot & VFS mounting.
+    while !BOOT_COMPLETE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
     loop {
         let mut did_work = false;
 
-        // 1. Drain Zero-Syscall IPC rings without context switches
+        // 1. Poll non-blocking network/remote console & drain Zero-Syscall IPC rings on AP (outside IRQ)
+        if idx == 1 {
+            crate::net::poll_network_and_remote_console();
+        }
         let processed_rings = crate::ipc::poll_active_rings();
         if processed_rings > 0 {
             block.compute_ticks.fetch_add(processed_rings as u64, Ordering::Relaxed);
-            block.irq_ticks.fetch_add(processed_rings as u64, Ordering::Relaxed);
             did_work = true;
         }
 
@@ -116,7 +171,6 @@ pub fn ap_worker_loop(cpu_id: u32) -> ! {
             block.active_proc_slot.store(SLOT_BG_DOWNLOADER, Ordering::Release);
             BG_DOWNLOADER_TICKS.fetch_add(1, Ordering::Relaxed);
             let bsw = BG_DOWNLOADER_SWITCHES.fetch_add(1, Ordering::Relaxed) + 1;
-            block.irq_ticks.fetch_add(1, Ordering::Relaxed);
             block.compute_ticks.fetch_add(1, Ordering::Relaxed);
             block.total_switches.store(bsw, Ordering::Relaxed);
             did_work = true;
@@ -125,14 +179,17 @@ pub fn ap_worker_loop(cpu_id: u32) -> ! {
         if !did_work {
             // Idle Power Governor: Core 1 suspends safely with interrupts enabled waiting for next hardware IRQ
             block.idle_ticks.fetch_add(1, Ordering::Relaxed);
-            block.irq_ticks.fetch_add(1, Ordering::Relaxed);
+            let pause_iters = crate::arch::x86_64::power_battery::idle_pause_iters();
+            let hlt_cycles = crate::arch::x86_64::power_battery::idle_hlt_cycles();
             // SAFETY: Low-power CPU pause and interrupt suspension sequence in Ring 0
             unsafe {
                 core::arch::asm!("sti", options(nomem, nostack));
-                for _ in 0..128 {
+                for _ in 0..pause_iters {
                     core::arch::x86_64::_mm_pause();
                 }
-                core::arch::asm!("hlt", options(nomem, nostack));
+                for _ in 0..hlt_cycles {
+                    core::arch::asm!("hlt", options(nomem, nostack));
+                }
                 core::arch::asm!("cli", options(nomem, nostack));
             }
         } else {

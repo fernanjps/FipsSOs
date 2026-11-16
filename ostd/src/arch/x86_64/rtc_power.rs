@@ -24,6 +24,26 @@ pub struct RtcDateTime {
     pub second: u8,
 }
 
+#[derive(Clone, Copy)]
+struct RtcCache {
+    valid: bool,
+    last_tick: u64,
+    dt: RtcDateTime,
+}
+
+static RTC_CACHE: crate::sync::SpinLock<RtcCache> = crate::sync::SpinLock::new(RtcCache {
+    valid: false,
+    last_tick: 0,
+    dt: RtcDateTime {
+        year: 2026,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    },
+});
+
 #[inline]
 unsafe fn cmos_read(reg: u8) -> u8 {
     // Bit 7 disables NMI; we keep NMI disabled during the brief read
@@ -48,18 +68,30 @@ fn bcd_to_bin(val: u8) -> u8 {
     (val & 0x0F) + ((val / 16) * 10)
 }
 
-/// Reads the current date and time from the CMOS RTC hardware registers (`0x70` / `0x71`).
+/// Reads the current date and time from the CMOS RTC hardware registers (`0x70` / `0x71`)
+/// with a 50-tick (0.5 s) RAM cache held under `RTC_CACHE` to prevent SMP port races and VM-exit stalls.
 pub fn read_rtc() -> RtcDateTime {
-    // Wait until Update In Progress (UIP, bit 7 of Status Register A) clears
-    for _ in 0..1000 {
-        // SAFETY: Reading standard CMOS Status Register A.
+    let now_tick = crate::arch::x86_64::idt::timer_ticks();
+    let mut cache = RTC_CACHE.lock();
+    if cache.valid && now_tick.saturating_sub(cache.last_tick) < 50 {
+        return cache.dt;
+    }
+
+    // Bounded check until Update In Progress (UIP, bit 7 of Status Register A) clears
+    let mut uip_clear = false;
+    for _ in 0..64 {
+        // SAFETY: Serialized by `RTC_CACHE` SpinLock; reading standard CMOS Status Register A.
         let status_a = unsafe { cmos_read(REG_STATUS_A) };
         if (status_a & 0x80) == 0 {
+            uip_clear = true;
             break;
         }
     }
+    if !uip_clear && cache.valid {
+        return cache.dt;
+    }
 
-    // SAFETY: Reading standard CMOS RTC time and date registers.
+    // SAFETY: Serialized by `RTC_CACHE` SpinLock; reading standard CMOS RTC time and date registers.
     let (mut sec, mut min, mut hour, mut day, mut month, mut year, status_b) = unsafe {
         (
             cmos_read(REG_SEC),
@@ -95,14 +127,20 @@ pub fn read_rtc() -> RtcDateTime {
         1900u16 + (year as u16)
     };
 
-    RtcDateTime {
+    let dt = RtcDateTime {
         year: full_year,
         month: month.clamp(1, 12),
         day: day.clamp(1, 31),
         hour: hour.clamp(0, 23),
         minute: min.clamp(0, 59),
         second: sec.clamp(0, 59),
-    }
+    };
+    *cache = RtcCache {
+        valid: true,
+        last_tick: now_tick,
+        dt,
+    };
+    dt
 }
 
 /// Converts an `RtcDateTime` into a standard POSIX UNIX timestamp (seconds since 1970-01-01 00:00:00 UTC).
@@ -136,13 +174,17 @@ pub fn rtc_to_unix_timestamp(dt: &RtcDateTime) -> i64 {
     days * 86400 + (dt.hour as i64) * 3600 + (dt.minute as i64) * 60 + (dt.second as i64)
 }
 
-/// Shuts down the system using ACPI PM1a_CNT S5 sleep state (QEMU `q35` `0x604` and `0xB004`).
+/// Shuts down the system using ACPI FADT `PM1a_CNT_BLK` S5 sleep state (falling back to q35/PIIX4 ports).
 pub fn system_shutdown() -> ! {
     crate::early_println!("[ACPI::Power] Apagando el equipo (ACPI S5 Power Off)...");
     crate::fb_println!("[ACPI] Apagando el equipo (ACPI S5)...");
 
+    let fadt_pm1a = super::acpi_tables::pm1a_cnt_port();
     // SAFETY: Writing standard ACPI PM1a_CNT S5 sleep bits in Ring 0.
     unsafe {
+        if let Some(port) = fadt_pm1a {
+            core::arch::asm!("out dx, ax", in("dx") port, in("ax") 0x2000u16, options(nomem, nostack));
+        }
         // QEMU q35 ACPI PM1a_CNT port: 0x604
         core::arch::asm!(
             "out dx, ax",
@@ -169,13 +211,17 @@ pub fn system_shutdown() -> ! {
     crate::halt_loop()
 }
 
-/// Restarts the system via the Reset Control Register (`0xCF9 = 0x06`) and PS/2 keyboard controller (`0x64 = 0xFE`).
+/// Restarts the system via ACPI FADT `RESET_REG`, `0xCF9 = 0x06`, and PS/2 `0x64 = 0xFE`.
 pub fn system_reboot() -> ! {
-    crate::early_println!("[ACPI::Power] Reiniciando el equipo (Hardware Reset 0xCF9 / 0x64)...");
+    crate::early_println!("[ACPI::Power] Reiniciando el equipo (ACPI FADT RESET_REG / 0xCF9 / 0x64)...");
     crate::fb_println!("[ACPI] Reiniciando el equipo (Hardware Reset)...");
 
-    // SAFETY: Writing standard x86 Reset Control Register (0xCF9) and PS/2 pulse (0x64).
+    let fadt_reset = super::acpi_tables::reset_reg();
+    // SAFETY: Writing ACPI FADT RESET_REG / x86 Reset Control Register (0xCF9) and PS/2 (0x64).
     unsafe {
+        if let Some((1, addr, val)) = fadt_reset {
+            core::arch::asm!("out dx, al", in("dx") addr as u16, in("al") val, options(nomem, nostack));
+        }
         // Reset Control Register: write 0x02, then 0x06
         core::arch::asm!(
             "out dx, al",

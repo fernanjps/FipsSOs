@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-static CALIBRATED_MHZ: AtomicU32 = AtomicU32::new(2400);
+static CALIBRATED_MHZ: AtomicU32 = AtomicU32::new(0);
 static LAST_SAMPLE_TSC: AtomicU64 = AtomicU64::new(0);
 static LAST_SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 
@@ -37,10 +37,19 @@ pub fn read_tsc() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Estimates CPU frequency in MHz by comparing RDTSC cycles against 100 Hz timer ticks (10 ms).
+/// Estimates CPU frequency in MHz using PIT-calibrated TSC immediately, refined by IRQ0 ticks.
 pub fn cpu_mhz() -> u32 {
     let cur_tsc = read_tsc();
     let cur_tick = crate::arch::idt::timer_ticks();
+
+    let mut cached = CALIBRATED_MHZ.load(Ordering::Relaxed);
+    if cached == 0 {
+        let hz = crate::time::tsc_hz();
+        if hz >= 100_000_000 {
+            cached = ((hz / 1_000_000) as u32).clamp(400, 6000);
+            CALIBRATED_MHZ.store(cached, Ordering::Relaxed);
+        }
+    }
 
     let last_tsc = LAST_SAMPLE_TSC.load(Ordering::Relaxed);
     let last_tick = LAST_SAMPLE_TICK.load(Ordering::Relaxed);
@@ -48,29 +57,26 @@ pub fn cpu_mhz() -> u32 {
     if last_tick == 0 {
         LAST_SAMPLE_TSC.store(cur_tsc, Ordering::Relaxed);
         LAST_SAMPLE_TICK.store(cur_tick, Ordering::Relaxed);
-        return CALIBRATED_MHZ.load(Ordering::Relaxed);
+        return cached;
     }
 
     let delta_ticks = cur_tick.saturating_sub(last_tick);
     if delta_ticks >= 20 {
-        // At 100 Hz, each tick is 10 ms (0.01 s).
-        // delta_ticks * 0.01 seconds elapsed.
-        // MHz = (delta_tsc / elapsed_seconds) / 1_000_000 = delta_tsc / (delta_ticks * 10_000).
         let delta_tsc = cur_tsc.saturating_sub(last_tsc);
-        let mhz = (delta_tsc / (delta_ticks * 10_000)).clamp(800, 5500) as u32;
+        let mhz = (delta_tsc / (delta_ticks * 10_000)).clamp(400, 6000) as u32;
         CALIBRATED_MHZ.store(mhz, Ordering::Relaxed);
         LAST_SAMPLE_TSC.store(cur_tsc, Ordering::Relaxed);
         LAST_SAMPLE_TICK.store(cur_tick, Ordering::Relaxed);
         mhz
     } else {
-        CALIBRATED_MHZ.load(Ordering::Relaxed)
+        cached
     }
 }
 
-/// Detects package temperature in Celsius via MSR `IA32_THERM_STATUS` (`0x19C`).
+/// Detects package temperature in Celsius via MSR `IA32_THERM_STATUS` (`0x19C`) with `#GP` trap guard.
 ///
-/// Returns 0 (`None`/unsupported) if running on AMD CPUs (`AuthenticAMD`), inside a
-/// hypervisor (VirtualBox / QEMU / KVM), or if MSR 0x19C is invalid or unreadable.
+/// Returns 0 if running on AMD CPUs (`AuthenticAMD`), inside a hypervisor,
+/// or if MSR `0x19C` is invalid or raises `#GP`.
 pub fn cpu_temperature_celsius() -> u32 {
     let topo = super::topology::detect();
 
@@ -91,25 +97,13 @@ pub fn cpu_temperature_celsius() -> u32 {
     };
 
     if dts_supported && topo.vendor() == "GenuineIntel" {
-        // Read IA32_THERM_STATUS (MSR 0x19C)
-        let low: u32;
-        let high: u32;
-        // SAFETY: Reading IA32_THERM_STATUS in Ring 0 if DTS supported.
-        unsafe {
-            core::arch::asm!(
-                "rdmsr",
-                in("ecx") 0x19Cu32,
-                out("eax") low,
-                out("edx") high,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        let val = ((high as u64) << 32) | (low as u64);
-        let valid = (val & (1 << 31)) != 0;
-        if valid {
-            let delta = ((val >> 16) & 0x7F) as u32;
-            // Standard TjMax = 100 C
-            return 100u32.saturating_sub(delta).clamp(25, 95);
+        if let Some(val) = super::msr::rdmsr_safe(0x19C) {
+            let valid = (val & (1 << 31)) != 0;
+            if valid {
+                let delta = ((val >> 16) & 0x7F) as u32;
+                // Standard TjMax = 100 C
+                return 100u32.saturating_sub(delta).clamp(25, 95);
+            }
         }
     }
 
@@ -127,6 +121,8 @@ pub fn snapshot() -> HardwareSensorsSnapshot {
     let threads = if online_cpus > 1 { online_cpus } else { topo.logical_cores as u16 }.max(1);
     let cores = threads;
 
+    let npu_present = crate::bus::pcie::is_npu_present();
+
     HardwareSensorsSnapshot {
         cpu_mhz: cpu_mhz(),
         temp_celsius: cpu_temperature_celsius(),
@@ -136,6 +132,6 @@ pub fn snapshot() -> HardwareSensorsSnapshot {
         e1000e_ok: net.link_up,
         ahci_ok: ahci.present,
         fb0_ok: fb_active,
-        npu_ok: true, // C11 NPU accelerator driver is active inside FfiJail
+        npu_ok: npu_present,
     }
 }

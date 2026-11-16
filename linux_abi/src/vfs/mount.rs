@@ -37,6 +37,7 @@ impl CapabilityVfs {
         self.directories.insert(String::from("/sys/devices"));
         self.directories.insert(String::from("/sys/devices/system"));
         self.directories.insert(String::from("/sys/devices/system/cpu"));
+        self.directories.insert(String::from("/tmp"));
 
         // Standard streams /dev/stdin (0), /dev/stdout (1), /dev/stderr (2)
         self.devices.insert(FD_STDIN, VfsDeviceNode {
@@ -48,6 +49,7 @@ impl CapabilityVfs {
             offset: 0,
             flags: 0,
             is_dir: false,
+            dirty: false,
             pipe: None,
             is_pipe_write: false,
             socket_id: None,
@@ -61,6 +63,7 @@ impl CapabilityVfs {
             offset: 0,
             flags: 0,
             is_dir: false,
+            dirty: false,
             pipe: None,
             is_pipe_write: false,
             socket_id: None,
@@ -74,6 +77,7 @@ impl CapabilityVfs {
             offset: 0,
             flags: 0,
             is_dir: false,
+            dirty: false,
             pipe: None,
             is_pipe_write: false,
             socket_id: None,
@@ -198,6 +202,30 @@ impl CapabilityVfs {
             ),
         );
 
+        let audio_vmo = Vmo::new(4096, VmoUsage::ZeroCopyAccel)
+            .expect("Fallo al reservar VMO para /dev/audio");
+        let audio_info = ostd::arch::x86_64::audio::status_summary();
+        let _ = audio_vmo.write(0, audio_info.as_bytes());
+        let audio_handle = self.handle_table.insert(
+            Arc::clone(&audio_vmo) as Arc<dyn KernelObject>,
+            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
+        );
+        self.record_parent_dirs(PATH_AUDIO);
+        self.register_file(String::from(PATH_AUDIO), audio_handle, audio_info.len(), true);
+        self.devices.insert(
+            FD_AUDIO,
+            VfsDeviceNode::new_vmo(
+                FD_AUDIO,
+                String::from(PATH_AUDIO),
+                audio_handle,
+                audio_info.len(),
+                true,
+            ),
+        );
+
+        self.record_parent_dirs(PATH_DEV_NULL);
+        self.register_file(String::from(PATH_DEV_NULL), kernel_objects::HandleId::null(), 0, true);
+
         // --- FASE v2.3: Zero-Syscall Shared Ring VMO (/dev/shm/io_ring & /dev/ipc/ring0) ---
         const RING_VMO_SIZE: usize = 64 * 1024;
         let ring_vmo = Vmo::new(RING_VMO_SIZE, VmoUsage::SharedRing)
@@ -238,50 +266,83 @@ impl CapabilityVfs {
             ),
         );
 
-        // Parse USTAR Initramfs from Limine ModuleRequest or fallback in-memory USTAR image
-        let fallback_tar;
-        let (tar_bytes, source_tag) = if let Some(module_slice) = ostd::boot::initramfs_slice() {
-            (module_slice, "Limine Module initramfs.tar")
+        // Parse USTAR Initramfs from Limine ModuleRequest (Zero-Copy) or fallback in-memory USTAR image
+        ostd::early_println!("[VFS] Montando Initramfs...");
+        ostd::fb_println!("[VFS] Montando Initramfs...");
+        ostd::fb_console::flush_console();
+        let mut mounted_files = 0usize;
+        if let Some(module_slice) = ostd::boot::initramfs_slice() {
+            let tar_entries = TarFs::parse(module_slice);
+            for entry in tar_entries {
+                let file_vmo = Vmo::from_static_slice(entry.data, VmoUsage::InitramfsFile);
+                let file_handle = self.handle_table.insert(
+                    Arc::clone(&file_vmo) as Arc<dyn KernelObject>,
+                    Rights::READ | Rights::MAP | Rights::TRANSFER,
+                );
+                let fd = self.next_fd;
+                self.next_fd += 1;
+
+                self.record_parent_dirs(&entry.path);
+                self.register_file(entry.path.clone(), file_handle, entry.data.len(), false);
+                self.devices.insert(
+                    fd,
+                    VfsDeviceNode::new_vmo(
+                        fd,
+                        entry.path.clone(),
+                        file_handle,
+                        entry.data.len(),
+                        false,
+                    ),
+                );
+                // Register lightweight VFS aliases without duplicating binaries in initramfs.tar
+                let aliases: &[&str] = match entry.path.as_str() {
+                    "/bin/desktop_ui.elf" => &["/bin/gui", "/bin/desktop"],
+                    "/bin/fipsos_sh.elf" => &["/bin/sh"],
+                    "/bin/pkg.elf" => &["/bin/pkg"],
+                    "/bin/kilo.elf" => &["/bin/edit"],
+                    "/bin/fipsos_httpd.elf" => &["/bin/httpd"],
+                    _ => &[],
+                };
+                for &alias in aliases {
+                    self.register_file(String::from(alias), file_handle, entry.data.len(), false);
+                }
+                mounted_files += 1;
+            }
         } else {
-            fallback_tar = TarFs::build_fallback_tar();
-            (fallback_tar.as_slice(), "TarFs In-Memory Fallback")
+            let fallback_tar = TarFs::build_fallback_tar();
+            let tar_entries = TarFs::parse(fallback_tar.as_slice());
+            for entry in tar_entries {
+                let alloc_len = entry.data.len().max(1);
+                let file_vmo = Vmo::new(alloc_len, VmoUsage::InitramfsFile)
+                    .expect("Fallo al reservar VMO para archivo de Initramfs");
+                if !entry.data.is_empty() {
+                    let _ = file_vmo.write(0, entry.data);
+                }
+                let file_handle = self.handle_table.insert(
+                    Arc::clone(&file_vmo) as Arc<dyn KernelObject>,
+                    Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
+                );
+                let fd = self.next_fd;
+                self.next_fd += 1;
+                self.record_parent_dirs(&entry.path);
+                self.register_file(entry.path.clone(), file_handle, entry.data.len(), false);
+                self.devices.insert(
+                    fd,
+                    VfsDeviceNode::new_vmo(fd, entry.path, file_handle, entry.data.len(), false),
+                );
+                mounted_files += 1;
+            }
+        }
+        let source_tag = if ostd::boot::initramfs_slice().is_some() {
+            "Limine Module initramfs.tar (Zero-Copy)"
+        } else {
+            "TarFs In-Memory Fallback"
         };
 
-        let tar_entries = TarFs::parse(tar_bytes);
-        let mut mounted_files = 0usize;
-
-        for entry in tar_entries {
-            let alloc_len = entry.data.len().max(4096);
-            let file_vmo = Vmo::new(alloc_len, VmoUsage::InitramfsFile)
-                .expect("Fallo al reservar VMO para archivo de Initramfs");
-            if !entry.data.is_empty() {
-                file_vmo
-                    .write(0, entry.data)
-                    .expect("Fallo al copiar contenido USTAR al VMO");
-            }
-            let file_handle = self.handle_table.insert(
-                Arc::clone(&file_vmo) as Arc<dyn KernelObject>,
-                Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-            );
-            let fd = self.next_fd;
-            self.next_fd += 1;
-
-            self.record_parent_dirs(&entry.path);
-            self.register_file(entry.path.clone(), file_handle, entry.data.len(), false);
-            self.devices.insert(
-                fd,
-                VfsDeviceNode::new_vmo(
-                    fd,
-                    entry.path,
-                    file_handle,
-                    entry.data.len(),
-                    false,
-                ),
-            );
-            mounted_files += 1;
-        }
-
-        // Initialize or mount persistent files from SATA AHCI DiskFS
+        // Initialize or mount persistent files from SATA AHCI DiskFS BEFORE FAT32 LBA 2048 probe/init
+        ostd::early_println!("[VFS] Montando DiskFS...");
+        ostd::fb_println!("[VFS] Montando DiskFS...");
+        ostd::fb_console::flush_console();
         let disk_files = crate::diskfs::init_or_mount();
         let mut mounted_disk = 0usize;
         for dfile in disk_files {
@@ -318,54 +379,56 @@ impl CapabilityVfs {
             }
         }
 
-        // 1. Mount /sys/fipsos/hwmon
-        let hwmon_text = build_hwmon_text();
-        let hwmon_vmo = Vmo::new(4096, VmoUsage::InitramfsFile)
-            .expect("Fallo al reservar VMO para /sys/fipsos/hwmon");
-        let _ = hwmon_vmo.write(0, hwmon_text.as_bytes());
-        let hwmon_handle = self.handle_table.insert(
-            Arc::clone(&hwmon_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        let fd_hwmon = self.next_fd;
-        self.next_fd += 1;
-        self.record_parent_dirs(PATH_SYS_HWMON);
-        self.register_file(String::from(PATH_SYS_HWMON), hwmon_handle, hwmon_text.len(), false);
-        self.devices.insert(
-            fd_hwmon,
-            VfsDeviceNode::new_vmo(
-                fd_hwmon,
-                String::from(PATH_SYS_HWMON),
-                hwmon_handle,
-                hwmon_text.len(),
-                false,
-            ),
-        );
+        // Probe, auto-initialize (at LBA 2048 if safe), and mount FAT32 at /mnt/fat0
+        ostd::early_println!("[VFS] Montando FAT32...");
+        ostd::fb_println!("[VFS] Montando FAT32...");
+        ostd::fb_console::flush_console();
+        if crate::fat32::mount_or_init().is_some() {
+            self.directories.insert(String::from("/mnt"));
+            self.directories.insert(String::from("/mnt/fat0"));
+            crate::fat32::format::seed_default_files();
+        }
 
-        // 2. Mount ProcFS synthetic files: /proc/meminfo, /proc/mounts, /proc/uptime, /proc/self/mounts, /etc/mtab
-        let meminfo_text = build_meminfo_text();
-        let meminfo_vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO /proc/meminfo fail");
-        let _ = meminfo_vmo.write(0, meminfo_text.as_bytes());
-        let meminfo_handle = self.handle_table.insert(
-            Arc::clone(&meminfo_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        self.record_parent_dirs(PATH_PROC_MEMINFO);
-        self.register_file(String::from(PATH_PROC_MEMINFO), meminfo_handle, meminfo_text.len(), false);
+        // 1. Mount /proc and /sys nodes lazily (content generated on open/read via dynamic_sysfs_text)
+        ostd::early_println!("[VFS] Montando /proc y /sys...");
+        ostd::fb_println!("[VFS] Montando /proc y /sys...");
+        ostd::fb_console::flush_console();
 
-        let mounts_text = build_mounts_text();
-        let mounts_vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO /proc/mounts fail");
-        let _ = mounts_vmo.write(0, mounts_text.as_bytes());
-        let mounts_handle = self.handle_table.insert(
-            Arc::clone(&mounts_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        self.record_parent_dirs(PATH_PROC_MOUNTS);
-        self.register_file(String::from(PATH_PROC_MOUNTS), mounts_handle, mounts_text.len(), false);
-        self.record_parent_dirs(PATH_PROC_SELF_MOUNTS);
-        self.register_file(String::from(PATH_PROC_SELF_MOUNTS), mounts_handle, mounts_text.len(), false);
-        self.record_parent_dirs(PATH_ETC_MTAB);
-        self.register_file(String::from(PATH_ETC_MTAB), mounts_handle, mounts_text.len(), false);
+        let lazy_nodes: [(&str, bool, bool); 14] = [
+            (PATH_SYS_HWMON, true, true),
+            (PATH_BAT0_CAPACITY, false, true),
+            (PATH_BAT0_STATUS, false, true),
+            (PATH_BAT0_PROFILE, true, true),
+            (PATH_BAT0_BOOST, false, true),
+            (PATH_WLAN0_OPERSTATE, false, true),
+            (PATH_PROC_MEMINFO, true, false),
+            (PATH_PROC_MOUNTS, true, false),
+            (PATH_PROC_SELF_MOUNTS, true, false),
+            (PATH_ETC_MTAB, true, false),
+            (PATH_PROC_UPTIME, true, false),
+            (PATH_PROC_VERSION, false, false),
+            (PATH_PROC_CPUINFO, true, false),
+            (PATH_PROC_STAT, true, false),
+        ];
+        for (path, writable, register_dev) in lazy_nodes {
+            let vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO lazy sysfs/procfs fail");
+            let rights = if writable {
+                Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER
+            } else {
+                Rights::READ | Rights::MAP | Rights::TRANSFER
+            };
+            let handle = self.handle_table.insert(Arc::clone(&vmo) as Arc<dyn KernelObject>, rights);
+            self.record_parent_dirs(path);
+            self.register_file(String::from(path), handle, 0, false);
+            if register_dev {
+                let fd = self.next_fd;
+                self.next_fd += 1;
+                self.devices.insert(
+                    fd,
+                    VfsDeviceNode::new_vmo(fd, String::from(path), handle, 0, false),
+                );
+            }
+        }
 
         // /etc/resolv.conf and /etc/hosts for libc network resolution
         let resolv_text = "nameserver 10.0.2.3\n";
@@ -388,39 +451,13 @@ impl CapabilityVfs {
         self.record_parent_dirs("/etc/hosts");
         self.register_file(String::from("/etc/hosts"), hosts_handle, hosts_text.len(), false);
 
-        let uptime_text = build_uptime_text();
-        let uptime_vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO /proc/uptime fail");
-        let _ = uptime_vmo.write(0, uptime_text.as_bytes());
-        let uptime_handle = self.handle_table.insert(
-            Arc::clone(&uptime_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        self.record_parent_dirs(PATH_PROC_UPTIME);
-        self.register_file(String::from(PATH_PROC_UPTIME), uptime_handle, uptime_text.len(), false);
-
-        // ProcFS Multiprocessor Telemetry: /proc/cpuinfo and /proc/stat
-        let cpuinfo_text = build_cpuinfo_text();
-        let cpuinfo_vmo = Vmo::new(8192, VmoUsage::InitramfsFile).expect("VMO /proc/cpuinfo fail");
-        let _ = cpuinfo_vmo.write(0, cpuinfo_text.as_bytes());
-        let cpuinfo_handle = self.handle_table.insert(
-            Arc::clone(&cpuinfo_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        self.record_parent_dirs(PATH_PROC_CPUINFO);
-        self.register_file(String::from(PATH_PROC_CPUINFO), cpuinfo_handle, cpuinfo_text.len(), false);
-
-        let stat_text = build_stat_text();
-        let stat_vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO /proc/stat fail");
-        let _ = stat_vmo.write(0, stat_text.as_bytes());
-        let stat_handle = self.handle_table.insert(
-            Arc::clone(&stat_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-        self.record_parent_dirs(PATH_PROC_STAT);
-        self.register_file(String::from(PATH_PROC_STAT), stat_handle, stat_text.len(), false);
-
         // SysFS CPU Topology: /sys/devices/system/cpu/online, possible, present
-        let online_str = "0-1\n";
+        let n_cpus = ostd::scheduler::online_cpu_count().max(1);
+        let online_str = if n_cpus <= 1 {
+            String::from("0\n")
+        } else {
+            alloc::format!("0-{}\n", n_cpus - 1)
+        };
         let online_vmo = Vmo::new(4096, VmoUsage::InitramfsFile).expect("VMO sys cpu online fail");
         let _ = online_vmo.write(0, online_str.as_bytes());
         let online_handle = self.handle_table.insert(
@@ -445,6 +482,7 @@ impl CapabilityVfs {
         );
         let fd_fault = self.next_fd;
         self.next_fd += 1;
+        reserve_unified_fd(self.next_fd);
         self.record_parent_dirs(PATH_FAULT_TEST);
         self.register_file(String::from(PATH_FAULT_TEST), fault_handle, fault_elf.len(), false);
         self.devices.insert(
@@ -458,14 +496,17 @@ impl CapabilityVfs {
             ),
         );
 
+        // 4. Seed zero-copy container base images (/containers/base-rootfs & ai-rootfs)
+        crate::container::seed_container_images(self);
+
         ostd::early_println!(
-            "[linux_abi::vfs] VFS montado: 5 dispositivos (/dev/*: drm, accel, fb0, mouse0, eth0) + {} archivos TarFs ({}) + {} archivos DiskFS (SATA AHCI) + /sys/fipsos/hwmon",
+            "[linux_abi::vfs] VFS montado: 6 dispositivos (/dev/*: drm, accel, fb0, mouse0, eth0, audio) + {} archivos TarFs ({}) + {} archivos DiskFS (SATA AHCI) + /sys/fipsos/hwmon",
             mounted_files,
             source_tag,
             mounted_disk
         );
         ostd::fb_println!(
-            "[linux_abi::vfs] VFS montado: 5 nodos /dev/* + {} TarFs + {} DiskFS + /sys/fipsos/hwmon",
+            "[linux_abi::vfs] VFS montado: 6 nodos /dev/* + {} TarFs + {} DiskFS + /sys/fipsos/hwmon",
             mounted_files,
             mounted_disk
         );

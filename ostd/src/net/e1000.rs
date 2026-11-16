@@ -152,7 +152,7 @@ impl E1000Controller {
             tx_buf_virt: [0; TX_RING_LEN],
             rx_tail: RX_RING_LEN - 1,
             tx_tail: 0,
-            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            mac: [0; 6],
             link_up: false,
             tx_packets: 0,
             rx_packets: 0,
@@ -166,7 +166,7 @@ impl E1000Controller {
     pub fn init_hardware(&mut self) {
         let Some((dev, bar0_phys, pci_cmd)) = probe_e1000_nic() else {
             crate::early_println!(
-                "[ostd::net::e1000] Sin controlador PCIe Intel e1000/e1000e; activando modo Loopback determinista."
+                "[ostd::net::e1000] No se detecto controlador PCIe Intel e1000/e1000e en el bus."
             );
             return;
         };
@@ -328,7 +328,7 @@ impl E1000Controller {
     pub fn snapshot(&self) -> NicHardwareSnapshot {
         let (bus, device, function, vendor_id, device_id) = match self.pci_dev {
             Some(d) => (d.bus, d.device, d.function, d.vendor_id, d.device_id),
-            None => (0, 2, 0, 0x8086, 0x10d3),
+            None => (0, 0, 0, 0, 0),
         };
         NicHardwareSnapshot {
             present: self.present,
@@ -353,16 +353,10 @@ impl E1000Controller {
     /// Copies an Ethernet II frame into `TxDesc[tx_tail]`, rings the hardware `TDT` doorbell (`0x3818`),
     /// and waits for Bus Master DMA completion (`DESC_STATUS_DD`).
     pub fn transmit_frame(&mut self, frame: &[u8]) -> bool {
-        if frame.is_empty() || frame.len() > PKT_BUF_SIZE {
+        if !self.present || self.mmio_virt == 0 || frame.is_empty() || frame.len() > PKT_BUF_SIZE {
             return false;
         }
         let wire_len = frame.len().max(60);
-
-        if !self.present {
-            self.tx_packets = self.tx_packets.wrapping_add(1);
-            self.tx_bytes = self.tx_bytes.wrapping_add(wire_len as u64);
-            return false;
-        }
 
         let idx = self.tx_tail;
         let dst_ptr = self.tx_buf_virt[idx] as *mut u8;
@@ -392,7 +386,8 @@ impl E1000Controller {
         self.write_reg(REG_TDT, self.tx_tail as u32);
 
         let mut completed = false;
-        for _ in 0..100_000 {
+        let tx_dl = crate::time::tsc_deadline_ms(50);
+        while !crate::time::tsc_expired(tx_dl) {
             // SAFETY: Polling volatile `status` byte updated by PCIe Bus Master DMA.
             let desc_now = unsafe { core::ptr::read_volatile(tx_descs.add(idx)) };
             if (desc_now.status & DESC_STATUS_DD) != 0 {
@@ -498,7 +493,8 @@ impl E1000Controller {
             (((word_addr as u32) << 8) | 1, 1u32 << 4)
         };
         self.write_reg(REG_EERD, cmd);
-        for _ in 0..20_000 {
+        let eep_dl = crate::time::tsc_deadline_ms(20);
+        while !crate::time::tsc_expired(eep_dl) {
             let val = self.read_reg(REG_EERD);
             if (val & done_mask) != 0 {
                 return Some(((val >> 16) & 0xFFFF) as u16);

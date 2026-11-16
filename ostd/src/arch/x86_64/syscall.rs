@@ -66,7 +66,14 @@ impl CpuLocal {
     }
 }
 
-static mut BSP_CPU_LOCAL: CpuLocal = CpuLocal::new();
+static mut CPU_LOCALS: [CpuLocal; crate::scheduler::MAX_CPUS] =
+    [const { CpuLocal::new() }; crate::scheduler::MAX_CPUS];
+
+#[inline]
+unsafe fn current_cpu_local_ptr() -> *mut CpuLocal {
+    let idx = crate::arch::current_cpu_id().min(crate::scheduler::MAX_CPUS - 1);
+    &raw mut CPU_LOCALS[idx]
+}
 
 core::arch::global_asm!(include_str!("trap.s"));
 
@@ -118,11 +125,18 @@ pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code
         // 1. Switch back to parent's isolated PML4 root
         crate::mm::switch_cr3(parent_ctx.parent_cr3);
 
-        // 2. Reclaim memory of the faulted child process
+        // 2. Reclaim memory and scheduler slot of the faulted child process
         if faulted_cr3 != parent_ctx.parent_cr3 && faulted_cr3 != crate::mm::master_kernel_cr3() {
             let _ = crate::mm::destroy_process_vm_space(faulted_cr3);
         }
 
+        if parent_ctx.is_fork {
+            let (faulted_pid, _) = crate::scheduler::active_pid_and_tid();
+            crate::scheduler::mark_process_exit(faulted_pid, signal_exit_code);
+        } else {
+            let (prev_slot, _) = crate::scheduler::on_exit_child(fault_rip);
+            crate::scheduler::reset_slot_capabilities(prev_slot);
+        }
         crate::scheduler::set_active_slot(parent_ctx.parent_slot);
 
         // 3. Restore parent's FPU/SSE2 context (FXRSTOR64)
@@ -133,8 +147,9 @@ pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code
 
         // 5. Restore parent's saved_kernel_rsp in CpuLocal
         unsafe {
+            let cpu_local = current_cpu_local_ptr();
             core::ptr::write_volatile(
-                &raw mut BSP_CPU_LOCAL.saved_kernel_rsp,
+                &raw mut (*cpu_local).saved_kernel_rsp,
                 parent_ctx.saved_kernel_rsp,
             );
         }
@@ -148,6 +163,8 @@ pub fn recover_from_user_fault(fault_rip: u64, fault_addr: u64, signal_exit_code
         }
     } else {
         // Top-level Ring 3 process: restore clean Master Kernel PML4
+        let (faulted_pid, _) = crate::scheduler::active_pid_and_tid();
+        crate::scheduler::mark_process_exit(faulted_pid, signal_exit_code);
         crate::mm::switch_cr3(crate::mm::master_kernel_cr3());
 
         if faulted_cr3 != crate::mm::master_kernel_cr3() {
@@ -358,11 +375,11 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
             user_rsp,
             parent_cr3,
         } => {
-            // SAFETY: Reading `BSP_CPU_LOCAL.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
+            // SAFETY: Reading `CpuLocal.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
             let parent_kernel_rsp =
-                unsafe { core::ptr::read_volatile(&raw const BSP_CPU_LOCAL.saved_kernel_rsp) };
+                unsafe { core::ptr::read_volatile(&raw const (*current_cpu_local_ptr()).saved_kernel_rsp) };
             let parent_fs_base = get_user_fs_base();
-            let parent_slot = crate::scheduler::active_slot();
+            let parent_slot = crate::scheduler::stacked_parent_slot();
             let mut parent_ctx = Box::new(SavedParentContext {
                 fpu_state: FpuState::new(), trap_frame: *frame, saved_kernel_rsp: parent_kernel_rsp,
                 parent_cr3, user_fs_base: parent_fs_base, is_fork: false, parent_slot,
@@ -379,9 +396,9 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
         SyscallAction::ForkChild {
             child_pid, child_cr3, parent_cr3, child_slot, child_rsp,
         } => {
-            // SAFETY: Reading `BSP_CPU_LOCAL.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
+            // SAFETY: Reading `CpuLocal.saved_kernel_rsp` (`gs:[0x10]`) in Ring 0.
             let parent_kernel_rsp =
-                unsafe { core::ptr::read_volatile(&raw const BSP_CPU_LOCAL.saved_kernel_rsp) };
+                unsafe { core::ptr::read_volatile(&raw const (*current_cpu_local_ptr()).saved_kernel_rsp) };
             let parent_fs_base = get_user_fs_base();
             let parent_slot = crate::scheduler::active_slot();
 
@@ -411,10 +428,12 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
         }
         SyscallAction::ExitUser(exit_code) => {
             let exiting_cr3 = crate::mm::active_cr3();
-            let (exited_pid, _) = crate::scheduler::active_pid_and_tid();
-            crate::scheduler::mark_process_exit(exited_pid, exit_code);
 
             if let Some(parent_ctx) = PARENT_CONTEXT_STACK.lock().pop() {
+                if parent_ctx.is_fork {
+                    let (exited_pid, _) = crate::scheduler::active_pid_and_tid();
+                    crate::scheduler::mark_process_exit(exited_pid, exit_code);
+                }
                 // Restore the parent's isolated `PML4` root in hardware `CR3` (flushes Lower-Half TLB)
                 crate::mm::switch_cr3(parent_ctx.parent_cr3);
 
@@ -433,16 +452,19 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
 
                 parent_ctx.fpu_state.restore();
                 set_user_fs_base(parent_ctx.user_fs_base);
-                // SAFETY: Restoring the parent process's `saved_kernel_rsp` into `BSP_CPU_LOCAL`.
+                // SAFETY: Restoring the parent process's `saved_kernel_rsp` into `CpuLocal`.
                 unsafe {
+                    let cpu_local = current_cpu_local_ptr();
                     core::ptr::write_volatile(
-                        &raw mut BSP_CPU_LOCAL.saved_kernel_rsp,
+                        &raw mut (*cpu_local).saved_kernel_rsp,
                         parent_ctx.saved_kernel_rsp,
                     );
                 }
                 0
             } else {
-                // Top-level user process exited: restore the clean Master Kernel `PML4`
+                // Top-level user process exited: mark exited and restore Master Kernel `PML4`
+                let (exited_pid, _) = crate::scheduler::active_pid_and_tid();
+                crate::scheduler::mark_process_exit(exited_pid, exit_code);
                 crate::mm::switch_cr3(crate::mm::master_kernel_cr3());
 
                 if exiting_cr3 != crate::mm::master_kernel_cr3() {
@@ -463,53 +485,42 @@ extern "C" fn __ostd_syscall_dispatch(frame: &mut TrapFrame) -> u64 {
     }
 }
 
+/// Initializes `PerCpuData` (`GS.base`/`KERNEL_GS_BASE`) and `syscall`/`sysretq` MSRs on `cpu_id`.
+pub unsafe fn init_core(cpu_id: usize) {
+    let idx = cpu_id.min(crate::scheduler::MAX_CPUS - 1);
+    let stack_top = (&raw const SYSCALL_STACK)
+        .cast::<u8>()
+        .add(SYSCALL_KERNEL_STACK_SIZE) as u64;
+
+    let cpu_local = &raw mut CPU_LOCALS[idx];
+    (*cpu_local).kernel_syscall_rsp = stack_top;
+    (*cpu_local).user_rsp_scratch = 0;
+    (*cpu_local).saved_kernel_rsp = 0;
+    (*cpu_local).user_exit_code = 0;
+    (*cpu_local).cpu_id = idx as u64;
+
+    wrmsr(MSR_IA32_GS_BASE, 0);
+    wrmsr(MSR_IA32_KERNEL_GS_BASE, cpu_local as u64);
+    core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+
+    let efer = rdmsr(MSR_IA32_EFER);
+    wrmsr(MSR_IA32_EFER, efer | EFER_SCE | EFER_NXE);
+    wrmsr(MSR_IA32_STAR, ((0x0010u64 | 3) << 48) | (0x0008u64 << 32));
+    wrmsr(MSR_IA32_LSTAR, __fipsos_syscall_entry as *const () as u64);
+    wrmsr(MSR_IA32_FMASK, SYSCALL_RFLAGS_MASK);
+}
+
 /// Configures `IA32_EFER`, `IA32_STAR`, `IA32_LSTAR`, `IA32_FMASK`, and `IA32_KERNEL_GS_BASE`
 /// (`CpuLocal` + `swapgs`) for SMP-safe Ring 3 `syscall`/`sysretq`.
 pub fn init() {
-    // SAFETY: Writing architectural x86_64 syscall and GS base MSRs in Ring 0.
+    // SAFETY: Writing architectural x86_64 syscall and GS base MSRs in Ring 0 on BSP (CPU 0).
     unsafe {
-        let stack_top = (&raw const SYSCALL_STACK)
-            .cast::<u8>()
-            .add(SYSCALL_KERNEL_STACK_SIZE) as u64;
-
-        BSP_CPU_LOCAL.kernel_syscall_rsp = stack_top;
-        BSP_CPU_LOCAL.user_rsp_scratch = 0;
-        BSP_CPU_LOCAL.saved_kernel_rsp = 0;
-        BSP_CPU_LOCAL.user_exit_code = 0;
-        BSP_CPU_LOCAL.cpu_id = 0;
-
-        let cpu_local_addr = (&raw const BSP_CPU_LOCAL) as u64;
-
-        // Initialize IA32_KERNEL_GS_BASE with CpuLocal address and IA32_GS_BASE with 0,
-        // then execute `swapgs` so Ring 0 runs with GS.base = &BSP_CPU_LOCAL and
-        // IA32_KERNEL_GS_BASE = 0 (ready to be swapped again upon entering Ring 3).
-        wrmsr(MSR_IA32_GS_BASE, 0);
-        wrmsr(MSR_IA32_KERNEL_GS_BASE, cpu_local_addr);
-        core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
-
-        // 1. Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in IA32_EFER
-        let efer = rdmsr(MSR_IA32_EFER);
-        wrmsr(MSR_IA32_EFER, efer | EFER_SCE | EFER_NXE);
-
-        // 2. Configure IA32_STAR:
-        //    Bits 47:32 = 0x0008 (Kernel CS=0x08, SS=0x10)
-        //    Bits 63:48 = 0x0010 | 3 = 0x0013 (User SS=(0x10+8)|3=0x1B, User CS=(0x10+16)|3=0x23)
-        //    Crucial: setting bits 49:48 to RPL=3 ensures AMD CPUs calculate SS with RPL=3 on sysretq!
-        let star: u64 = ((0x0010u64 | 3) << 48) | (0x0008u64 << 32);
-        wrmsr(MSR_IA32_STAR, star);
-
-        // 3. Configure IA32_LSTAR with the address of `__fipsos_syscall_entry` in `trap.s`
-        let lstar = __fipsos_syscall_entry as *const () as u64;
-        wrmsr(MSR_IA32_LSTAR, lstar);
-
-        // 4. Configure IA32_FMASK to clear IF, TF, and AC on syscall entry
-        wrmsr(MSR_IA32_FMASK, SYSCALL_RFLAGS_MASK);
-
+        init_core(0);
         crate::early_println!(
             "[ostd::arch::syscall] MSRs + swapgs CpuLocal@{:#x} + EFER.NXE (W^X) activos (STAR={:#x}, LSTAR={:#x})",
-            cpu_local_addr,
-            star,
-            lstar
+            (&raw const CPU_LOCALS[0]) as u64,
+            rdmsr(MSR_IA32_STAR),
+            rdmsr(MSR_IA32_LSTAR)
         );
     }
 }
@@ -582,9 +593,5 @@ pub fn get_user_fs_base() -> u64 {
     // SAFETY: Reading architectural MSR_IA32_FS_BASE.
     unsafe { rdmsr(MSR_IA32_FS_BASE) }
 }
-
 /// Sets the Ring 3 `MSR_IA32_FS_BASE` (Thread-Local Storage base).
-pub fn set_user_fs_base(addr: u64) {
-    // SAFETY: Writing architectural MSR_IA32_FS_BASE.
-    unsafe { wrmsr(MSR_IA32_FS_BASE, addr) };
-}
+pub fn set_user_fs_base(addr: u64) { unsafe { wrmsr(MSR_IA32_FS_BASE, addr) }; }

@@ -6,7 +6,8 @@ use super::slots::{
 };
 use super::smp_idle::{CPU_CONTROLS, MAX_CPUS};
 use super::{
-    DAEMON_ACTIVE, DAEMON_PID, BG_DOWNLOADER_ACTIVE, BG_DOWNLOADER_PID, SHELL_PID,
+    DAEMON_ACTIVE, DAEMON_PID, BG_DOWNLOADER_ACTIVE, BG_DOWNLOADER_PID,
+    BG_HTTPD_ACTIVE, BG_HTTPD_PID, SHELL_PID,
 };
 
 /// Returns `Ok(old_handler)` or `Err(errno)`.
@@ -94,6 +95,13 @@ pub fn send_signal(pid: u64, sig: usize) -> Result<(), i64> {
     let ppid = table[i].ppid;
 
     if sig == 9 /* SIGKILL */ || (sig == 15 /* SIGTERM */ && handler == 0) {
+        let victim_slot = table[i].slot;
+        let mut victim_cr3 = 0u64;
+        if victim_slot >= 2 {
+            victim_cr3 = table[i].cr3_phys;
+            table[i].cr3_phys = 0;
+            super::telemetry::mark_slot_reclaimed_external(victim_slot);
+        }
         table[i].state = TaskSlotState::Zombie;
         table[i].is_running = false;
         table[i].exit_code = (128 + sig as i32) << 8;
@@ -101,6 +109,13 @@ pub fn send_signal(pid: u64, sig: usize) -> Result<(), i64> {
             if let Some(parent) = table.iter_mut().find(|e| e.pid == ppid) {
                 parent.pending_signals |= 1 << 17; // SIGCHLD
             }
+        }
+        drop(table);
+        if victim_cr3 != 0
+            && victim_cr3 != crate::mm::active_cr3()
+            && victim_cr3 != crate::mm::master_kernel_cr3()
+        {
+            let _ = crate::mm::destroy_process_vm_space(victim_cr3);
         }
         return Ok(());
     }
@@ -112,6 +127,13 @@ pub fn send_signal(pid: u64, sig: usize) -> Result<(), i64> {
 
     // Default action without user handler
     if sig == 2 /* SIGINT */ || sig == 3 /* SIGQUIT */ || sig == 15 /* SIGTERM */ {
+        let victim_slot = table[i].slot;
+        let mut victim_cr3 = 0u64;
+        if victim_slot >= 2 {
+            victim_cr3 = table[i].cr3_phys;
+            table[i].cr3_phys = 0;
+            super::telemetry::mark_slot_reclaimed_external(victim_slot);
+        }
         table[i].state = TaskSlotState::Zombie;
         table[i].is_running = false;
         table[i].exit_code = (128 + sig as i32) << 8;
@@ -119,6 +141,13 @@ pub fn send_signal(pid: u64, sig: usize) -> Result<(), i64> {
             if let Some(parent) = table.iter_mut().find(|e| e.pid == ppid) {
                 parent.pending_signals |= 1 << 17;
             }
+        }
+        drop(table);
+        if victim_cr3 != 0
+            && victim_cr3 != crate::mm::active_cr3()
+            && victim_cr3 != crate::mm::master_kernel_cr3()
+        {
+            let _ = crate::mm::destroy_process_vm_space(victim_cr3);
         }
         return Ok(());
     }
@@ -158,31 +187,42 @@ pub fn pop_pending_signal(pid: u64) -> Option<(usize, u64)> {
 pub fn kill_task(target: u64, sig: u64) -> Result<u64, i64> {
     let daemon_pid = DAEMON_PID.load(Ordering::Relaxed);
     let bg_pid = BG_DOWNLOADER_PID.load(Ordering::Relaxed);
+    let httpd_pid = BG_HTTPD_PID.load(Ordering::Acquire);
     let shell_pid = SHELL_PID.load(Ordering::Relaxed);
 
     if target == shell_pid || target == SLOT_SHELL {
         return Err(-1); // EPERM (operation not permitted on init/shell)
     }
 
+    if httpd_pid != 0 && target == httpd_pid && BG_HTTPD_ACTIVE.load(Ordering::Acquire) {
+        if sig == 0 {
+            return Ok(httpd_pid);
+        }
+        BG_HTTPD_ACTIVE.store(false, Ordering::Release);
+        return Ok(httpd_pid);
+    }
+
     if target == daemon_pid || target == SLOT_DAEMON {
         DAEMON_ACTIVE.store(false, Ordering::Release);
-        if let Some(mut table) = SCHEDULER_LOCK.try_lock() {
-            table[SLOT_DAEMON as usize].is_running = false;
-        }
+        let mut table = SCHEDULER_LOCK.lock();
+        table[SLOT_DAEMON as usize].is_running = false;
+        table[SLOT_DAEMON as usize].state = TaskSlotState::Exited;
+        table[SLOT_DAEMON as usize].exit_code = 9;
         return Ok(daemon_pid);
     } else if target == bg_pid || target == SLOT_BG_DOWNLOADER {
         BG_DOWNLOADER_ACTIVE.store(false, Ordering::Release);
-        if let Some(mut table) = SCHEDULER_LOCK.try_lock() {
-            table[SLOT_BG_DOWNLOADER as usize].is_running = false;
-        }
+        let mut table = SCHEDULER_LOCK.lock();
+        table[SLOT_BG_DOWNLOADER as usize].is_running = false;
+        table[SLOT_BG_DOWNLOADER as usize].state = TaskSlotState::Exited;
+        table[SLOT_BG_DOWNLOADER as usize].exit_code = 9;
+        drop(table);
         if MAX_CPUS > 1 {
             CPU_CONTROLS[1].active_proc_slot.store(SLOT_DAEMON, Ordering::Release);
         }
         return Ok(bg_pid);
     }
 
-    let signal_num = if sig == 0 { 9 } else { sig as usize };
-    send_signal(target, signal_num)?;
+    send_signal(target, sig as usize)?;
     Ok(target)
 }
 

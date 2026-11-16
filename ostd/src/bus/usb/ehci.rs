@@ -1,6 +1,6 @@
-use crate::bus::pcie::DiscoveredUsbDevice;
+use crate::bus::pcie::{pci_read_u32, pci_write_u32, DiscoveredUsbDevice};
 use crate::mm::map_kernel_mmio;
-use super::{UsbControllerKind, UsbControllerTelemetry, LEGACY_USB_MMIO_SIZE};
+use super::{UsbControllerKind, UsbControllerTelemetry, LEGACY_USB_MMIO_SIZE, USB_CTRL_TIMEOUT_MS};
 
 pub const EHCI_MMIO_SIZE: usize = 0x1000;
 
@@ -18,10 +18,32 @@ pub fn init_ehci(usb: &DiscoveredUsbDevice) -> UsbControllerTelemetry {
                     (clen as u64, ver, hcs, hcc)
                 };
 
-                let max_ports = (hcsparams & 0x0F) as u8;
+                let max_ports = ((hcsparams & 0x0F) as u8).min(15);
                 let eecp = ((hccparams >> 8) & 0xFF) as u8;
                 if eecp >= 0x40 {
-                    super::xhci::perform_bios_handoff(usb.dev.bus, usb.dev.device, usb.dev.function, eecp);
+                    let mut off = eecp;
+                    for _ in 0..16 {
+                        let cap_dword = pci_read_u32(usb.dev.bus, usb.dev.device, usb.dev.function, off);
+                        let cap_id = (cap_dword & 0xFF) as u8;
+                        let next_off = ((cap_dword >> 8) & 0xFF) as u8;
+                        if cap_id == 1 {
+                            pci_write_u32(usb.dev.bus, usb.dev.device, usb.dev.function, off, cap_dword | (1 << 24));
+                            let ho_deadline = crate::time::tsc_deadline_ms(USB_CTRL_TIMEOUT_MS);
+                            while !crate::time::tsc_expired(ho_deadline) {
+                                if (pci_read_u32(usb.dev.bus, usb.dev.device, usb.dev.function, off) & (1 << 16)) == 0 {
+                                    break;
+                                }
+                                core::hint::spin_loop();
+                            }
+                            let ctlsts = pci_read_u32(usb.dev.bus, usb.dev.device, usb.dev.function, off + 4);
+                            pci_write_u32(usb.dev.bus, usb.dev.device, usb.dev.function, off + 4, ctlsts & 0xFFFF_0000);
+                            break;
+                        }
+                        if next_off < 0x40 {
+                            break;
+                        }
+                        off = next_off;
+                    }
                 }
 
                 let opbase = capbase + caplen;
@@ -34,11 +56,18 @@ pub fn init_ehci(usb: &DiscoveredUsbDevice) -> UsbControllerTelemetry {
 
                 let mut is_halted = (usbsts & (1 << 12)) != 0;
                 if is_halted {
-                    // Set Run bit (bit 0) in USBCMD
+                    // Set Run bit (bit 0) in USBCMD with bounded 100 ms TSC timeout
                     unsafe {
                         core::ptr::write_volatile(opbase as *mut u32, usbcmd | 0x01);
-                        let updated = core::ptr::read_volatile((opbase + 0x04) as *const u32);
-                        is_halted = (updated & (1 << 12)) != 0;
+                        let run_deadline = crate::time::tsc_deadline_ms(USB_CTRL_TIMEOUT_MS);
+                        while !crate::time::tsc_expired(run_deadline) {
+                            let updated = core::ptr::read_volatile((opbase + 0x04) as *const u32);
+                            is_halted = (updated & (1 << 12)) != 0;
+                            if !is_halted {
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
                     }
                 }
 

@@ -14,15 +14,43 @@ impl CapabilityVfs {
             return Ok(self.devices.len() as u64);
         }
         if request == VFS_IOCTL_LIST_PROCESSES {
-            let count = SchedulerRegistry::print_ps_table();
+            let mut count = SchedulerRegistry::print_ps_table();
+            let (bg_active, bg_pid, bg_port) = ostd::scheduler::bg_httpd_status();
+            if bg_active {
+                ostd::early_println!(
+                    "  | {:<5} | {:<18} | RunningBg (HTTP :{})\n",
+                    bg_pid,
+                    "fipsos_httpd",
+                    bg_port
+                );
+                ostd::fb_println!(
+                    "  | {:<5} | {:<18} | RunningBg (HTTP :{})",
+                    bg_pid,
+                    "fipsos_httpd",
+                    bg_port
+                );
+                count += 1;
+            }
             return Ok(count as u64);
+        }
+        if request == 0xC0105303 {
+            let (active, pid, port) = ostd::scheduler::bg_httpd_status();
+            let mut pkt = [0u8; 24];
+            pkt[0..8].copy_from_slice(&(if active { 1u64 } else { 0u64 }).to_le_bytes());
+            pkt[8..16].copy_from_slice(&pid.to_le_bytes());
+            pkt[16..24].copy_from_slice(&(port as u64).to_le_bytes());
+            ostd::arch::syscall::write_user_bytes(arg, &pkt).map_err(|_| -14i64)?;
+            return Ok(if active { 1 } else { 0 });
+        }
+        if let Some(res) = self.dispatch_live_telemetry_ioctl(fd, request, arg) {
+            return res;
         }
         if request == DISK_IOCTL_SAVE_NOTE {
             let ticks = ostd::arch::idt::timer_ticks();
             let _ = crate::diskfs::save_persistent_note(ticks);
             let ahci = ostd::storage::ahci_snapshot();
             let note_text = alloc::format!(
-                "[DiskFS] Nota persistente de usuario FipSOs v1.6\n\
+                "[DiskFS] Nota persistente de usuario FipSOs v6.3\n\
                  Timestamp IRQ0: {} ticks\n\
                  Dispositivo: Intel ICH9 SATA AHCI 00:1f.2 (Port {})\n\
                  LBA Lecturas: {} sectores | LBA Escrituras: {} sectores\n\
@@ -88,8 +116,9 @@ impl CapabilityVfs {
         if request == VFS_IOCTL_HWMON_REPORT {
             let hw_text = build_hwmon_text();
             if arg != 0 {
-                let write_len = hw_text.len().min(4096);
+                let write_len = hw_text.len().min(4095);
                 ostd::mm::write_user_bytes(arg, &hw_text.as_bytes()[..write_len]).map_err(|_| -14i64)?;
+                ostd::mm::write_user_bytes(arg + write_len as u64, &[0u8]).map_err(|_| -14i64)?;
             }
             return Ok(hw_text.len() as u64);
         }
@@ -159,6 +188,9 @@ impl CapabilityVfs {
             };
 
             let (res, payload) = ostd::net::http_fetch_url(&uri_str);
+            if payload.is_empty() {
+                return Err(if res.icmp_reply_ok { -111i64 } else { -101i64 });
+            }
             let _ = crate::diskfs::save_file(save_path, &payload);
             let (dl_fd, dl_koid) = self.create_or_update_disk_file(save_path, &payload)?;
 
@@ -178,6 +210,23 @@ impl CapabilityVfs {
                 payload.len()
             );
             return Ok(payload.len() as u64);
+        }
+        if request == WIFI_IOCTL_LOAD_FW {
+            let mut fw_buf = [0u8; 64];
+            ostd::mm::read_user_bytes(arg, &mut fw_buf).map_err(|_| -14i64)?;
+            let len = fw_buf.iter().position(|&b| b == 0).unwrap_or(fw_buf.len());
+            let fw_name = core::str::from_utf8(&fw_buf[..len]).map_err(|_| -22i64)?;
+            return crate::net_80211::load_wifi_firmware_from_vfs(self, fw_name);
+        }
+        if request == WIFI_IOCTL_WPA2_TEST {
+            let summary = crate::net_80211::run_wpa2_ccmp_selftest()?;
+            if arg != 0 {
+                let mut out = [0u8; 128];
+                let n = summary.len().min(127);
+                out[..n].copy_from_slice(&summary.as_bytes()[..n]);
+                ostd::mm::write_user_bytes(arg, &out[..=n]).map_err(|_| -14i64)?;
+            }
+            return Ok(0);
         }
         if request == VFS_IOCTL_SYS_TELEMETRY {
             let mem = ostd::mm::stats();

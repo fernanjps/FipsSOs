@@ -146,12 +146,12 @@ impl MouseState {
         }
     }
 
-    fn apply_synthetic_step(&mut self, dx: i16, dy: i16, buttons: u8) -> (usize, usize, u8, MouseSnapshot) {
-        self.x = (self.x + (dx as i32)).clamp(0, self.max_x);
-        self.y = (self.y + (dy as i32)).clamp(0, self.max_y);
+    fn apply_delta(&mut self, dx: i32, dy: i32, buttons: u8) -> (usize, usize, u8, MouseSnapshot) {
+        self.x = (self.x + dx).clamp(0, self.max_x);
+        self.y = (self.y + dy).clamp(0, self.max_y);
 
         let clean_buttons = buttons & 0x07;
-        if clean_buttons != 0 {
+        if (clean_buttons & !self.buttons) != 0 {
             self.click_count = self.click_count.wrapping_add(1);
         }
         self.buttons = clean_buttons;
@@ -262,29 +262,44 @@ pub(crate) fn on_irq12() {
     }
 }
 
-/// Drains any pending auxiliary mouse bytes waiting in the 8042 controller and returns the latest `MouseSnapshot`.
+/// Drains any pending auxiliary PS/2 bytes and USB xHCI HID mouse events, returning the latest `MouseSnapshot`.
 pub fn poll_state() -> MouseSnapshot {
-    // SAFETY: Checking PS/2 controller status (`0x64`) for pending auxiliary bytes (`bit 5 | bit 0`).
-    unsafe {
-        for _ in 0..6 {
-            let status = inb(PS2_STATUS_CMD_PORT);
-            if (status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
-                == (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
-            {
-                let data = inb(PS2_DATA_PORT);
-                process_packet_byte(data);
-            } else {
-                break;
+    // Poll USB xHCI HID event ring first (safe: does not hold MOUSE lock).
+    crate::bus::usb::xhci::poll_xhci_events();
+
+    // Mask local interrupts while reading 0x64/0x60 so IRQ12 cannot race the packet parser.
+    crate::arch::without_interrupts(|| {
+        // SAFETY: Checking PS/2 controller status (`0x64`) for pending auxiliary bytes (`bit 5 | bit 0`).
+        unsafe {
+            for _ in 0..24 {
+                let status = inb(PS2_STATUS_CMD_PORT);
+                if (status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
+                    == (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
+                {
+                    let data = inb(PS2_DATA_PORT);
+                    process_packet_byte(data);
+                } else {
+                    break;
+                }
             }
         }
-    }
+    });
     MOUSE.lock().snapshot()
+}
+
+/// Injects a decoded USB HID Boot Mouse report (`buttons`, `dx`, `dy`, `wheel`) into the global pointer queue.
+pub fn inject_usb_hid_report(buttons: u8, dx: i8, dy: i8, _wheel: i8) -> MouseSnapshot {
+    let (x, y, btn, snap) = MOUSE.lock().apply_delta(dx as i32, dy as i32, buttons);
+    if crate::fb_console::is_desktop_mode() {
+        crate::fb_console::draw_mouse_cursor_overlay(x, y, btn);
+    }
+    snap
 }
 
 /// Injects a synthetic relative pointer movement `(dx, dy)` and button mask (`left=1, right=2, middle=4`)
 /// so pointer events and clicks can also be tested from keyboard/console without host mouse grab.
 pub fn inject_synthetic_mouse_step(dx: i16, dy: i16, buttons: u8) -> MouseSnapshot {
-    let (x, y, btn, snap) = MOUSE.lock().apply_synthetic_step(dx, dy, buttons);
+    let (x, y, btn, snap) = MOUSE.lock().apply_delta(dx as i32, dy as i32, buttons);
     crate::fb_console::draw_mouse_cursor_overlay(x, y, btn);
     snap
 }
@@ -307,9 +322,10 @@ unsafe fn send_mouse_command(cmd: u8) -> u8 {
 
 #[inline]
 unsafe fn wait_ps2_write() {
-    // SAFETY: Polling read-only PS/2 status port 0x64.
+    // SAFETY: Polling read-only PS/2 status port 0x64 with a real 10 ms TSC deadline.
     unsafe {
-        for _ in 0..100_000 {
+        let deadline = crate::time::tsc_deadline_ms(10);
+        while !crate::time::tsc_expired(deadline) {
             if (inb(PS2_STATUS_CMD_PORT) & STATUS_INPUT_BUSY) == 0 {
                 return;
             }
@@ -320,9 +336,10 @@ unsafe fn wait_ps2_write() {
 
 #[inline]
 unsafe fn wait_ps2_read() -> bool {
-    // SAFETY: Polling read-only PS/2 status port 0x64.
+    // SAFETY: Polling read-only PS/2 status port 0x64 with a real 10 ms TSC deadline.
     unsafe {
-        for _ in 0..100_000 {
+        let deadline = crate::time::tsc_deadline_ms(10);
+        while !crate::time::tsc_expired(deadline) {
             if (inb(PS2_STATUS_CMD_PORT) & STATUS_OUTPUT_FULL) != 0 {
                 return true;
             }

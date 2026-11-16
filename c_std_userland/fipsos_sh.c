@@ -20,13 +20,29 @@
 
 #define MAX_LINE 512
 #define MAX_ARGS 32
+#define SYS_FIPS_SANDBOX 450
+
+extern long syscall(long number, ...);
 
 static int parse_args(char* str, char** argv, int max_args) {
     int argc = 0;
-    char* token = strtok(str, " \t");
-    while (token && argc < max_args - 1) {
-        argv[argc++] = token;
-        token = strtok(NULL, " \t");
+    char* p = str;
+    while (*p && argc < max_args - 1) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char* out = p;
+        argv[argc++] = out;
+        while (*p && *p != ' ' && *p != '\t') {
+            if (*p == '\'' || *p == '"') {
+                char q = *p++;
+                while (*p && *p != q) *out++ = *p++;
+                if (*p == q) p++;
+            } else {
+                *out++ = *p++;
+            }
+        }
+        if (*p) p++;
+        *out = '\0';
     }
     argv[argc] = NULL;
     return argc;
@@ -37,16 +53,56 @@ static int execute_command(int argc, char** argv) {
         return 0;
     }
 
+    int is_bg = 0;
+    if (argc > 1 && strcmp(argv[argc - 1], "&") == 0) {
+        is_bg = 1;
+        argv[--argc] = NULL;
+    } else if (argc > 0) {
+        size_t alen = strlen(argv[argc - 1]);
+        if (alen > 1 && argv[argc - 1][alen - 1] == '&') {
+            argv[argc - 1][alen - 1] = '\0';
+            is_bg = 1;
+        }
+    }
+    if (argc == 0 || !argv[0] || !*argv[0]) {
+        return 0;
+    }
+
     /* 1. Try built-in commands first */
     if (handle_builtin(argc, argv)) {
         return 0;
+    }
+
+    int is_sandbox = 0;
+    if (strcmp(argv[0], "sandbox") == 0) {
+        if (argc < 2) {
+            printf("Uso: sandbox <comando> [args...]\n");
+            return 0;
+        }
+        is_sandbox = 1;
+        argv++;
+        argc--;
+    }
+
+    char* bg_argv[MAX_ARGS + 1];
+    if (is_bg && strstr(argv[0], "httpd") != NULL) {
+        int k = 0;
+        int has_bg = 0;
+        while (k < argc && k < MAX_ARGS - 1) {
+            bg_argv[k] = argv[k];
+            if (strcmp(argv[k], "--bg") == 0) has_bg = 1;
+            k++;
+        }
+        if (!has_bg) bg_argv[k++] = "--bg";
+        bg_argv[k] = NULL;
+        argv = bg_argv;
     }
 
     const char* cmd = argv[0];
 
     /* 2. Program shortcut aliases */
     char binary_path[256];
-    if (strcmp(cmd, "gui") == 0) {
+    if (strcmp(cmd, "gui") == 0 || strcmp(cmd, "desktop") == 0) {
         snprintf(binary_path, sizeof(binary_path), "/bin/desktop_ui.elf");
     } else if (strcmp(cmd, "capp") == 0) {
         snprintf(binary_path, sizeof(binary_path), "/bin/c_std_app.elf");
@@ -62,12 +118,17 @@ static int execute_command(int argc, char** argv) {
         snprintf(binary_path, sizeof(binary_path), "/bin/kilo.elf");
     } else if (strcmp(cmd, "sample") == 0 || strcmp(cmd, "sample_tool") == 0) {
         snprintf(binary_path, sizeof(binary_path), "/bin/sample_tool.elf");
+    } else if (strcmp(cmd, "ai") == 0) {
+        snprintf(binary_path, sizeof(binary_path), "/bin/fips_ai");
+    } else if (strcmp(cmd, "docker") == 0) {
+        snprintf(binary_path, sizeof(binary_path), "/bin/docker");
     } else if (cmd[0] == '/' || cmd[0] == '.') {
         snprintf(binary_path, sizeof(binary_path), "%s", cmd);
     } else if (strstr(cmd, ".elf") != NULL) {
         snprintf(binary_path, sizeof(binary_path), "/bin/%s", cmd);
     } else {
-        snprintf(binary_path, sizeof(binary_path), "/bin/%s.elf", cmd);
+        /* Try extensionless exact path first, then .elf fallback in child */
+        snprintf(binary_path, sizeof(binary_path), "/bin/%s", cmd);
     }
 
     /* 3. Execute external binary via fork() + execve() + wait4()/waitpid() */
@@ -82,12 +143,19 @@ static int execute_command(int argc, char** argv) {
         return -1;
     } else if (pid == 0) {
         /* Child process */
+        if (is_bg) {
+            syscall(SYS_FIPS_SANDBOX, 0x1FUL, 2UL); /* SANDBOX_AUTO_REAP */
+        }
+        if (is_sandbox) {
+            /* CAP_FS_READ(1) | CAP_FS_WRITE(2) | CAP_SPAWN(8) = 0x0B, SANDBOX_RESTRICT_FAT0 = 1 */
+            syscall(SYS_FIPS_SANDBOX, 0x0BUL, 1UL);
+        }
         int ret = execve(binary_path, argv, envp);
         if (ret < 0 && cmd[0] != '/' && cmd[0] != '.') {
             const char* candidate_formats[] = {
-                "/bin/%s",
-                "/disk/bin/%s.elf",
                 "/disk/bin/%s",
+                "/bin/%s.elf",
+                "/disk/bin/%s.elf",
                 "/disk/%s",
                 NULL
             };
@@ -104,11 +172,15 @@ static int execute_command(int argc, char** argv) {
         }
         exit(0);
     } else {
-        /* Parent process: wait for child to complete */
-        int wstatus = 0;
-        waitpid(pid, &wstatus, 0);
-        if (strcmp(cmd, "gui") == 0) {
-            printf("\n\033[1;32m[fipsos_sh]\033[0m Sesion de escritorio cerrada. Consola TTY 1280x800 restaurada OK.\n");
+        /* Parent process: wait for child unless launched in background with '&' */
+        if (is_bg) {
+            printf("[bg] PID=%d\n", (int)pid);
+        } else {
+            int wstatus = 0;
+            waitpid(pid, &wstatus, 0);
+            if (strcmp(cmd, "gui") == 0 || strcmp(cmd, "desktop") == 0) {
+                printf("\n\033[1;32m[fipsos_sh]\033[0m Sesion de escritorio cerrada. Consola TTY 1280x800 restaurada OK.\n");
+            }
         }
     }
 
@@ -195,6 +267,7 @@ int main(int argc, char** argv) {
     char* cmd_args[MAX_ARGS];
 
     while (1) {
+        while (waitpid(-1, NULL, 1) > 0) {}
         char cwd[128];
         if (!getcwd(cwd, sizeof(cwd))) {
             strcpy(cwd, "/");
@@ -220,8 +293,21 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        /* Check for pipe operator '|' */
-        char* pipe_ptr = strchr(line, '|');
+        /* Check for pipe operator '|' (first unquoted) */
+        char* pipe_ptr = NULL;
+        {
+            int p_sq = 0, p_dq = 0;
+            for (char* p = line; *p; p++) {
+                if (*p == '\'' && !p_dq) {
+                    p_sq = !p_sq;
+                } else if (*p == '"' && !p_sq) {
+                    p_dq = !p_dq;
+                } else if (*p == '|' && !p_sq && !p_dq) {
+                    pipe_ptr = p;
+                    break;
+                }
+            }
+        }
         if (pipe_ptr != NULL) {
             *pipe_ptr = '\0';
             char* left_str = line;
@@ -230,14 +316,36 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        /* Check for redirection '>' */
-        char* redir_ptr = strchr(line, '>');
-        if (redir_ptr != NULL && strncmp(line, "echo ", 5) != 0) {
+        /* Check for redirection '>' or '>>' (rightmost unquoted) */
+        char* redir_ptr = NULL;
+        int redir_append = 0;
+        int in_sq = 0, in_dq = 0;
+        for (char* p = line; *p; p++) {
+            if (*p == '\'' && !in_dq) {
+                in_sq = !in_sq;
+            } else if (*p == '"' && !in_sq) {
+                in_dq = !in_dq;
+            } else if (*p == '>' && !in_sq && !in_dq) {
+                redir_ptr = p;
+                if (*(p + 1) == '>') {
+                    redir_append = 1;
+                    p++;
+                } else {
+                    redir_append = 0;
+                }
+            }
+        }
+        if (redir_ptr != NULL) {
             *redir_ptr = '\0';
-            char* file_part = redir_ptr + 1;
+            char* file_part = redir_ptr + (redir_append ? 2 : 1);
             while (*file_part == ' ' || *file_part == '\t') file_part++;
+            size_t flen = strlen(file_part);
+            while (flen > 0 && (file_part[flen - 1] == ' ' || file_part[flen - 1] == '\t')) {
+                file_part[--flen] = '\0';
+            }
             if (*file_part) {
-                int out_fd = open(file_part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                int out_flags = O_WRONLY | O_CREAT | (redir_append ? O_APPEND : O_TRUNC);
+                int out_fd = open(file_part, out_flags, 0644);
                 if (out_fd >= 0) {
                     int saved_out = dup(1);
                     dup2(out_fd, 1);

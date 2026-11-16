@@ -1,10 +1,7 @@
 #![forbid(unsafe_code)]
 
 use alloc::string::String;
-use alloc::sync::Arc;
-use kernel_objects::{KernelObject, Koid, Rights, Vmo, VmoUsage};
 
-use super::fd_table::VfsDeviceNode;
 use super::CapabilityVfs;
 
 pub struct DirEntryInfo {
@@ -67,6 +64,9 @@ fn path_basename(path: &str) -> &str {
 impl CapabilityVfs {
     pub fn is_directory(&self, path: &str) -> bool {
         let norm = normalize_path(path);
+        if norm == "/mnt/fat0" || norm.starts_with("/mnt/fat0/") {
+            return crate::fat32::is_dir(&norm);
+        }
         self.directories.contains(&norm)
     }
 
@@ -82,6 +82,33 @@ impl CapabilityVfs {
         let norm_dir = normalize_path(dir_path);
         let mut entries = alloc::vec::Vec::new();
         let mut seen = alloc::collections::BTreeSet::new();
+
+        if norm_dir == "/mnt/fat0" || norm_dir.starts_with("/mnt/fat0/") {
+            let fat_entries = crate::fat32::list_dir(&norm_dir);
+            for (name, is_dir, size) in [
+                (String::from("."), true, 4096),
+                (String::from(".."), true, 4096),
+            ] {
+                seen.insert(name.clone());
+                entries.push(DirEntryInfo {
+                    name,
+                    is_dir,
+                    is_chr: false,
+                    size,
+                });
+            }
+            for fe in fat_entries {
+                if seen.insert(fe.name.clone()) {
+                    entries.push(DirEntryInfo {
+                        name: fe.name,
+                        is_dir: fe.is_dir,
+                        is_chr: false,
+                        size: fe.size as usize,
+                    });
+                }
+            }
+            return entries;
+        }
 
         entries.push(DirEntryInfo {
             name: String::from("."),
@@ -135,115 +162,6 @@ impl CapabilityVfs {
         }
 
         entries
-    }
-
-    /// Dynamically creates a brand-new `Vmo` containing `payload` and mounts or updates `path`
-    /// inside `CapabilityVfs` so downloaded files (e.g. `/downloads/fipsos_pkg.txt`) are immediately
-    /// visible via `ls` and readable via `sys_open`/`sys_read` (`cat`).
-    pub fn create_or_update_downloaded_file(
-        &mut self,
-        path: &'static str,
-        payload: &[u8],
-    ) -> Result<(u64, Koid), i64> {
-        let alloc_len = payload.len().max(4096);
-        let file_vmo = Vmo::new(alloc_len, VmoUsage::InitramfsFile).map_err(|_| -12i64)?;
-        if !payload.is_empty() {
-            file_vmo.write(0, payload).map_err(|_| -22i64)?;
-        }
-        let koid = file_vmo.koid();
-        let file_handle = self.handle_table.insert(
-            Arc::clone(&file_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::MAP | Rights::TRANSFER,
-        );
-
-        let existing_fd = self
-            .devices
-            .values()
-            .find(|n| n.path == path)
-            .map(|n| n.fd);
-        let fd = match existing_fd {
-            Some(reuse_fd) => reuse_fd,
-            None => {
-                let fresh_fd = self.next_fd;
-                self.next_fd += 1;
-                fresh_fd
-            }
-        };
-
-        self.record_parent_dirs(path);
-        self.register_file(String::from(path), file_handle, payload.len(), false);
-        self.devices.insert(
-            fd,
-            VfsDeviceNode::new_vmo(
-                fd,
-                String::from(path),
-                file_handle,
-                payload.len(),
-                false,
-            ),
-        );
-
-        Ok((fd, koid))
-    }
-
-    /// Dynamically creates or updates a persistent `Vmo` backed file on the SATA disk
-    /// (e.g. `/disk/persistent_note.txt`).
-    pub fn create_or_update_disk_file(
-        &mut self,
-        path: &str,
-        payload: &[u8],
-    ) -> Result<(u64, Koid), i64> {
-        let alloc_len = payload.len().max(4096);
-        let file_vmo = Vmo::new(alloc_len, VmoUsage::InitramfsFile).map_err(|_| -12i64)?;
-        if !payload.is_empty() {
-            file_vmo.write(0, payload).map_err(|_| -22i64)?;
-        }
-        let koid = file_vmo.koid();
-        let file_handle = self.handle_table.insert(
-            Arc::clone(&file_vmo) as Arc<dyn KernelObject>,
-            Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
-        );
-
-        let existing_fd = self
-            .devices
-            .values()
-            .find(|n| n.path == path)
-            .map(|n| n.fd);
-        let fd = match existing_fd {
-            Some(reuse_fd) => reuse_fd,
-            None => {
-                let fresh_fd = self.next_fd;
-                self.next_fd += 1;
-                fresh_fd
-            }
-        };
-
-        self.record_parent_dirs(path);
-        self.register_file(String::from(path), file_handle, payload.len(), false);
-        self.devices.insert(
-            fd,
-            VfsDeviceNode::new_vmo(
-                fd,
-                String::from(path),
-                file_handle,
-                payload.len(),
-                false,
-            ),
-        );
-
-        Ok((fd, koid))
-    }
-
-    /// Removes a file node by path from the VFS device directory and releases its capability handle.
-    pub fn remove_node(&mut self, path: &str) -> bool {
-        let norm = normalize_path(path);
-        let removed_meta = self.registered_files.remove(&norm);
-        self.devices.retain(|_, n| n.path != norm);
-        if let Some(meta) = removed_meta {
-            let _ = self.handle_table.remove(meta.handle);
-            return true;
-        }
-        false
     }
 
     /// Removes a directory by path from the VFS directory set.

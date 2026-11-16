@@ -8,15 +8,18 @@ use ostd::mm::map_vmo_to_user;
 pub mod devfs_sysfs;
 pub mod dir;
 pub mod fd_table;
+pub mod file_nodes;
 pub mod ioctl;
 pub mod mount;
 pub mod ops;
 pub mod pipe;
+pub mod telemetry;
 
 pub use devfs_sysfs::*;
 pub use dir::*;
 pub use fd_table::*;
 pub use pipe::*;
+pub use telemetry::*;
 
 #[derive(Clone, Debug)]
 pub struct VfsFileMeta {
@@ -32,6 +35,7 @@ pub struct CapabilityVfs {
     handle_table: HandleTable,
     devices: BTreeMap<u64, VfsDeviceNode>,
     pub registered_files: BTreeMap<String, VfsFileMeta>,
+    pub(crate) shared_vmo_state: BTreeMap<u32, (usize, bool)>,
     directories: BTreeSet<String>,
     pub next_fd: u64,
 }
@@ -44,9 +48,29 @@ impl CapabilityVfs {
             handle_table: HandleTable::new(),
             devices: BTreeMap::new(),
             registered_files: BTreeMap::new(),
+            shared_vmo_state: BTreeMap::new(),
             directories: BTreeSet::new(),
             next_fd: 10,
         }
+    }
+
+    pub fn alloc_fd(&mut self) -> u64 {
+        let fd = alloc_unified_fd();
+        self.next_fd = fd + 1;
+        fd
+    }
+
+    pub fn register_raw_vmo_handle(
+        &mut self,
+        obj: alloc::sync::Arc<dyn KernelObject>,
+        rights: Rights,
+    ) -> HandleId {
+        self.handle_table.insert(obj, rights)
+    }
+
+    /// Removes and returns a global device/file table entry for orphan reclamation.
+    pub fn remove_device_node(&mut self, fd: u64) -> Option<VfsDeviceNode> {
+        self.devices.remove(&fd)
     }
 
     pub fn register_file(&mut self, path: String, handle: HandleId, file_size: usize, is_device: bool) {
@@ -130,15 +154,6 @@ impl CapabilityVfs {
             len,
             prot,
             flags,
-            vmo.koid(),
-            user_vaddr,
-            target_phys
-        );
-        ostd::fb_println!(
-            "[linux_abi::vfs] sys_mmap(fd={} \"{}\", len={} B) -> Zero-Copy VMO {} en UserVirt={:#x} (Phys={:#x})",
-            fd,
-            node.path,
-            len,
             vmo.koid(),
             user_vaddr,
             target_phys

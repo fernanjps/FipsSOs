@@ -209,7 +209,7 @@ impl FramebufferConsole {
         self.fill_rect(0, 0, self.width, HEADER_HEIGHT - 2, COLOR_HEADER_BG);
         self.fill_rect(0, HEADER_HEIGHT - 2, self.width, 2, COLOR_HEADER_BORDER);
 
-        let title = "FipSOs v3.1 Framekernel (x86_64 SMP | Multi-USB xHCI/EHCI/OHCI | DHCP | TCP Remote :2222)";
+        let title = "FipSOs v6.3 Framekernel (x86_64 SMP | Containers | FAT32 LBA 2048)";
         if self.width >= 1200 {
             self.draw_str_at(title, TEXT_LEFT_X, 16, COLOR_HEADER_TITLE, 2);
         } else {

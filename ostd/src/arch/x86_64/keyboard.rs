@@ -49,6 +49,8 @@ struct KeyboardState {
     right_shift: bool,
     left_alt: bool,
     right_alt: bool,
+    left_ctrl: bool,
+    right_ctrl: bool,
     caps_lock: bool,
     extended: bool,
     waker: Option<Waker>,
@@ -65,6 +67,8 @@ impl KeyboardState {
             right_shift: false,
             left_alt: false,
             right_alt: false,
+            left_ctrl: false,
+            right_ctrl: false,
             caps_lock: false,
             extended: false,
             waker: None,
@@ -103,11 +107,17 @@ impl KeyboardState {
                 let make = scancode & 0x7F;
                 if make == 0x38 {
                     self.right_alt = false;
+                } else if make == 0x1D {
+                    self.right_ctrl = false;
                 }
                 return None;
             }
             if scancode == 0x38 {
                 self.right_alt = true;
+                return None;
+            }
+            if scancode == 0x1D {
+                self.right_ctrl = true;
                 return None;
             }
             return match scancode {
@@ -225,6 +235,14 @@ impl KeyboardState {
                 self.left_alt = false;
                 None
             }
+            0x1D => {
+                self.left_ctrl = true;
+                None
+            }
+            0x9D => {
+                self.left_ctrl = false;
+                None
+            }
             0x3A => {
                 self.caps_lock = !self.caps_lock;
                 None
@@ -267,6 +285,12 @@ impl KeyboardState {
                     } else if ch.is_ascii_uppercase() {
                         ch = ch.to_ascii_lowercase();
                     }
+                }
+
+                if (self.left_ctrl || self.right_ctrl) && ch.is_ascii_alphabetic() {
+                    ch = (ch.to_ascii_lowercase() - b'a') + 1;
+                } else if (self.left_ctrl || self.right_ctrl) && matches!(ch, b'1'..=b'4') {
+                    ch = 0x81 + (ch - b'1');
                 }
 
                 if ch != 0 {
@@ -360,26 +384,28 @@ pub fn try_pop_key_nonblocking() -> Option<u8> {
         return Some(ch);
     }
 
-    // Drain up to 4 pending hardware PS/2 bytes in case a key/mouse byte arrived while IF=0 during a syscall
-    // SAFETY: Reading PS/2 status port (0x64) and data port (0x60) in Ring 0.
-    unsafe {
-        for _ in 0..4 {
-            let status = inb(PS2_STATUS_PORT);
-            if (status & 0x01) != 0 {
-                let data = inb(PS2_DATA_PORT);
-                if (status & 0x20) != 0 {
-                    super::mouse::process_packet_byte(data);
-                } else {
-                    let waker = KEYBOARD.lock().handle_scancode(data);
-                    if let Some(w) = waker {
-                        w.wake();
+    // Drain up to 4 pending hardware PS/2 bytes with interrupts masked so IRQ1/IRQ12 cannot race 0x64/0x60
+    crate::arch::without_interrupts(|| {
+        // SAFETY: Reading PS/2 status port (0x64) and data port (0x60) in Ring 0.
+        unsafe {
+            for _ in 0..4 {
+                let status = inb(PS2_STATUS_PORT);
+                if (status & 0x01) != 0 {
+                    let data = inb(PS2_DATA_PORT);
+                    if (status & 0x20) != 0 {
+                        super::mouse::process_packet_byte(data);
+                    } else {
+                        let waker = KEYBOARD.lock().handle_scancode(data);
+                        if let Some(w) = waker {
+                            w.wake();
+                        }
                     }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
-    }
+    });
 
     if let Some(ch) = KEYBOARD.lock().pop_byte() {
         return Some(ch);
@@ -395,12 +421,13 @@ pub fn try_pop_key_nonblocking() -> Option<u8> {
     super::serial::try_read_byte()
 }
 
-/// Blocks efficiently using `sti; hlt; cli` until an ASCII character arrives from `IRQ1`
-/// (PS/2 Keyboard), USB HID xHCI, TCP Remote Console, or UART COM1.
-pub fn read_char_blocking() -> u8 {
+/// Cooperatively waits for the next console/keyboard input event without 100% CPU busy-waiting,
+/// polling PS/2, USB xHCI HID, TCP remote console, and UART COM1 between `sti; hlt; cli` cycles.
+pub fn wait_for_input_event() -> u8 {
     loop {
         crate::net::poll_network_and_remote_console();
-        if let Some(ch) = try_read_char() {
+        crate::bus::xhci::poll_xhci_events();
+        if let Some(ch) = try_pop_key_nonblocking() {
             return ch;
         }
 
@@ -411,9 +438,12 @@ pub fn read_char_blocking() -> u8 {
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
         }
-
-        crate::net::poll_network_and_remote_console();
     }
+}
+
+/// Blocks efficiently using `wait_for_input_event()` until an ASCII character arrives.
+pub fn read_char_blocking() -> u8 {
+    wait_for_input_event()
 }
 
 #[inline]

@@ -65,18 +65,8 @@ struct DescriptorTablePointer {
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 static mut GDT: GdtTable = GdtTable { entries: [0; 7] };
 
-static mut AP_TSS: [TaskStateSegment; 4] = [
-    TaskStateSegment::new(),
-    TaskStateSegment::new(),
-    TaskStateSegment::new(),
-    TaskStateSegment::new(),
-];
-static mut AP_GDT: [GdtTable; 4] = [
-    GdtTable { entries: [0; 7] },
-    GdtTable { entries: [0; 7] },
-    GdtTable { entries: [0; 7] },
-    GdtTable { entries: [0; 7] },
-];
+static mut AP_TSS: [TaskStateSegment; 16] = [const { TaskStateSegment::new() }; 16];
+static mut AP_GDT: [GdtTable; 16] = [const { GdtTable { entries: [0; 7] } }; 16];
 
 /// Initializes the x86_64 GDT (Ring 0 & Ring 3 segments) and loads the TSS.
 pub fn init() {
@@ -150,7 +140,7 @@ pub fn init() {
 /// Initializes a dedicated GDT and TSS for an Application Processor (`AP`),
 /// loading `GDTR`, resetting segment registers (`CS=0x08`, `DS/ES/SS=0x10`), and loading `TR=0x28`.
 pub unsafe fn init_ap_gdt(cpu_id: usize, stack_top: u64) {
-    let idx = cpu_id.min(3);
+    let idx = cpu_id.min(15);
     let tss = &raw mut AP_TSS[idx];
     (*tss).privilege_stack_table[0] = stack_top;
     (*tss).interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = stack_top;

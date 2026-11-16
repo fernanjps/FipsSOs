@@ -98,6 +98,8 @@ pub fn init_slots(
     DESKTOP_UI_TID.store(desktop_ui_tid, Ordering::Release);
     PARENT_SLOT_DEPTH.store(0, Ordering::Release);
     ACTIVE_SLOT.store(SLOT_SHELL, Ordering::Release);
+    super::slots::sync_slot_identity(SLOT_SHELL, shell_pid, "fipsos_sh");
+    super::slots::sync_slot_identity(SLOT_DAEMON, daemon_pid, "npu-telemetryd");
 
     // SAFETY: Preparing initial context-switch frame at the top of `DAEMON_STACK` and seeding
     // the 512-byte `FXSAVE64` state buffers (`ACTIVE_FPU_STATE` and `DAEMON_FPU_STATE`).
@@ -201,10 +203,13 @@ pub fn spawn_background_downloader() -> (u64, u64) {
     let tid = BG_DOWNLOADER_TID.load(Ordering::Acquire);
     BG_DOWNLOADER_ACTIVE.store(true, Ordering::Release);
     BG_DOWNLOADER_SWITCHES.fetch_add(1, Ordering::Relaxed);
-    if let Some(mut table) = SCHEDULER_LOCK.try_lock() {
-        table[SLOT_BG_DOWNLOADER as usize].is_running = true;
-        table[SLOT_BG_DOWNLOADER as usize].assigned_cpu = 1;
-    }
+    let mut table = SCHEDULER_LOCK.lock();
+    table[SLOT_BG_DOWNLOADER as usize].pid = pid;
+    table[SLOT_BG_DOWNLOADER as usize].state = TaskSlotState::Running;
+    table[SLOT_BG_DOWNLOADER as usize].is_running = true;
+    table[SLOT_BG_DOWNLOADER as usize].assigned_cpu = 1;
+    table[SLOT_BG_DOWNLOADER as usize].set_name("bg_downloader");
+    drop(table);
     if MAX_CPUS > 1 {
         CPU_CONTROLS[1].active_proc_slot.store(SLOT_BG_DOWNLOADER, Ordering::Release);
     }

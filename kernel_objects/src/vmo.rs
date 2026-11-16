@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
-use ostd::mm::{DmaBuffer, DmaError, PhysAddr, VirtAddr, PAGE_SIZE};
+use ostd::mm::{virt_to_phys, DmaBuffer, DmaError, PhysAddr, VirtAddr, PAGE_SIZE};
+use ostd::sync::SpinLock;
 
 use crate::object::{KernelObject, Koid, ObjectType};
 
@@ -122,6 +125,8 @@ impl VmoRingHeader {
 pub enum VmoError {
     /// Underlying physical frame / DMA allocation error.
     AllocationFailed(DmaError),
+    /// Attempted write to a read-only Zero-Copy static VMO.
+    ReadOnly,
     /// Out-of-bounds read or write on the VMO.
     OutOfBounds {
         offset: usize,
@@ -151,34 +156,77 @@ impl From<DmaError> for VmoError {
 ///
 /// Supports Zero-Copy sharing across user processes, GPU DRM buffers (Vulkan textures),
 /// and NPU accelerator tensors (`/dev/accel`).
-#[derive(Debug)]
+enum VmoBacking {
+    Contiguous(Arc<DmaBuffer>),
+    StaticSlice(&'static [u8]),
+    Paged(Arc<SpinLock<Vec<u8>>>),
+}
+
+/// Virtual Memory Object (`Vmo`) wrapping physical frames or Zero-Copy slices via `Arc`.
+///
+/// Supports Zero-Copy sharing across user processes, GPU DRM buffers (Vulkan textures),
+/// NPU accelerator tensors (`/dev/accel`), and Zero-Copy `initramfs` payloads.
 pub struct Vmo {
     koid: Koid,
     requested_size: usize,
     usage: VmoUsage,
-    buffer: Arc<DmaBuffer>,
+    backing: VmoBacking,
+}
+
+impl fmt::Debug for Vmo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vmo")
+            .field("koid", &self.koid)
+            .field("requested_size", &self.requested_size)
+            .field("usage", &self.usage)
+            .finish()
+    }
 }
 
 impl Vmo {
-    /// Allocates a new `Vmo` backed by physically contiguous 4 KiB frames in `ostd::mm`.
+    /// Allocates a new `Vmo`. `ZeroCopyAccel`, `SharedRing`, and `ProcessMemory` use physically
+    /// contiguous `DmaBuffer` frames; `InitramfsFile` uses paged heap memory to avoid exhausting
+    /// contiguous physical frames.
     pub fn new(requested_size: usize, usage: VmoUsage) -> Result<Arc<Self>, VmoError> {
-        let dma_buffer = DmaBuffer::allocate(requested_size)?;
+        let backing = match usage {
+            VmoUsage::InitramfsFile => {
+                let len = requested_size.max(1);
+                VmoBacking::Paged(Arc::new(SpinLock::new(vec![0u8; len])))
+            }
+            _ => VmoBacking::Contiguous(Arc::new(DmaBuffer::allocate(requested_size)?)),
+        };
         Ok(Arc::new(Self {
             koid: Koid::allocate(),
             requested_size,
             usage,
-            buffer: Arc::new(dma_buffer),
+            backing,
         }))
     }
 
-    /// Creates a child/shared `Vmo` that shares the exact same underlying `Arc<DmaBuffer>`
-    /// physical frames (Zero-Copy) with a new `Koid`.
+    /// Creates a Zero-Copy read-only `Vmo` backed directly by a `'static` slice (e.g. Limine
+    /// `initramfs.tar` in HHDM) without allocating or copying any extra physical frames.
+    pub fn from_static_slice(slice: &'static [u8], usage: VmoUsage) -> Arc<Self> {
+        Arc::new(Self {
+            koid: Koid::allocate(),
+            requested_size: slice.len(),
+            usage,
+            backing: VmoBacking::StaticSlice(slice),
+        })
+    }
+
+    /// Creates a child/shared `Vmo` that shares the exact same underlying backing
+    /// (Zero-Copy) with a new `Koid`.
     pub fn clone_shared(&self) -> Arc<Self> {
+        let backing = match &self.backing {
+            VmoBacking::Contiguous(buf) => VmoBacking::Contiguous(Arc::clone(buf)),
+            VmoBacking::StaticSlice(s) => VmoBacking::StaticSlice(*s),
+            VmoBacking::Paged(v) => VmoBacking::Paged(Arc::clone(v)),
+        };
         Arc::new(Self {
             koid: Koid::allocate(),
             requested_size: self.requested_size,
             usage: self.usage,
-            buffer: Arc::clone(&self.buffer),
+            backing,
         })
     }
 
@@ -188,28 +236,47 @@ impl Vmo {
         self.requested_size
     }
 
-    /// Actual page-aligned size in bytes (multiple of `4096`).
+    /// Actual capacity in bytes.
     #[inline]
     pub fn size_bytes(&self) -> usize {
-        self.buffer.size_bytes()
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.size_bytes(),
+            VmoBacking::StaticSlice(s) => s.len(),
+            VmoBacking::Paged(v) => v.lock().len(),
+        }
     }
 
     /// Number of 4 KiB physical frames backing this `Vmo`.
     #[inline]
     pub fn frame_count(&self) -> usize {
-        self.buffer.frame_count()
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.frame_count(),
+            VmoBacking::StaticSlice(s) => s.len().div_ceil(PAGE_SIZE),
+            VmoBacking::Paged(v) => v.lock().len().div_ceil(PAGE_SIZE),
+        }
     }
 
-    /// Base physical address of the contiguous backing frames (for DMA / GPU / NPU engines).
+    /// Base physical address of the backing memory (HHDM-translated for static/paged VMOs).
     #[inline]
     pub fn phys_addr(&self) -> PhysAddr {
-        self.buffer.paddr()
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.paddr(),
+            VmoBacking::StaticSlice(s) => virt_to_phys(s.as_ptr() as VirtAddr).unwrap_or(0),
+            VmoBacking::Paged(v) => {
+                let g = v.lock();
+                virt_to_phys(g.as_ptr() as VirtAddr).unwrap_or(0)
+            }
+        }
     }
 
     /// Base virtual address in the Higher-Half Direct Map (HHDM).
     #[inline]
     pub fn virt_addr(&self) -> VirtAddr {
-        self.buffer.vaddr()
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.vaddr(),
+            VmoBacking::StaticSlice(s) => s.as_ptr() as VirtAddr,
+            VmoBacking::Paged(v) => v.lock().as_ptr() as VirtAddr,
+        }
     }
 
     /// Usage profile of this `Vmo`.
@@ -218,16 +285,30 @@ impl Vmo {
         self.usage
     }
 
-    /// Number of active `Arc` references to the underlying `DmaBuffer`.
+    /// Number of active `Arc` references to the underlying backing.
     #[inline]
     pub fn shared_ref_count(&self) -> usize {
-        Arc::strong_count(&self.buffer)
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => Arc::strong_count(buf),
+            VmoBacking::StaticSlice(_) => 1,
+            VmoBacking::Paged(v) => Arc::strong_count(v),
+        }
+    }
+
+    /// Reference to the underlying contiguous `DmaBuffer`, if contiguous.
+    #[inline]
+    pub fn try_dma_buffer(&self) -> Option<&DmaBuffer> {
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => Some(buf),
+            _ => None,
+        }
     }
 
     /// Reference to the underlying contiguous `DmaBuffer`.
     #[inline]
     pub fn dma_buffer(&self) -> &DmaBuffer {
-        &self.buffer
+        self.try_dma_buffer()
+            .expect("dma_buffer() invocado sobre un Vmo no contiguo")
     }
 
     /// Page size constant (`4096` bytes).
@@ -238,12 +319,67 @@ impl Vmo {
 
     /// Safely reads bytes from the `Vmo` at `offset` into `dst`.
     pub fn read(&self, offset: usize, dst: &mut [u8]) -> Result<(), VmoError> {
-        self.buffer.read_bytes(offset, dst).map_err(VmoError::from)
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.read_bytes(offset, dst).map_err(VmoError::from),
+            VmoBacking::StaticSlice(s) => {
+                let end = offset.checked_add(dst.len()).ok_or(VmoError::OutOfBounds {
+                    offset,
+                    len: dst.len(),
+                    size: s.len(),
+                })?;
+                if end > s.len() {
+                    return Err(VmoError::OutOfBounds {
+                        offset,
+                        len: dst.len(),
+                        size: s.len(),
+                    });
+                }
+                dst.copy_from_slice(&s[offset..end]);
+                Ok(())
+            }
+            VmoBacking::Paged(v) => {
+                let g = v.lock();
+                let end = offset.checked_add(dst.len()).ok_or(VmoError::OutOfBounds {
+                    offset,
+                    len: dst.len(),
+                    size: g.len(),
+                })?;
+                if end > g.len() {
+                    return Err(VmoError::OutOfBounds {
+                        offset,
+                        len: dst.len(),
+                        size: g.len(),
+                    });
+                }
+                dst.copy_from_slice(&g[offset..end]);
+                Ok(())
+            }
+        }
     }
 
     /// Safely writes bytes from `src` into the `Vmo` at `offset`.
     pub fn write(&self, offset: usize, src: &[u8]) -> Result<(), VmoError> {
-        self.buffer.write_bytes(offset, src).map_err(VmoError::from)
+        match &self.backing {
+            VmoBacking::Contiguous(buf) => buf.write_bytes(offset, src).map_err(VmoError::from),
+            VmoBacking::StaticSlice(_) => Err(VmoError::ReadOnly),
+            VmoBacking::Paged(v) => {
+                let mut g = v.lock();
+                let end = offset.checked_add(src.len()).ok_or(VmoError::OutOfBounds {
+                    offset,
+                    len: src.len(),
+                    size: g.len(),
+                })?;
+                if end > g.len() {
+                    return Err(VmoError::OutOfBounds {
+                        offset,
+                        len: src.len(),
+                        size: g.len(),
+                    });
+                }
+                g[offset..end].copy_from_slice(src);
+                Ok(())
+            }
+        }
     }
 }
 

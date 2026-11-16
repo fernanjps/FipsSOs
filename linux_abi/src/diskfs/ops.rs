@@ -9,7 +9,10 @@ use alloc::vec::Vec;
 use super::inode::*;
 
 pub(crate) fn format_and_create_initial() -> Vec<DiskFsFile> {
-    const INITIAL_CONTENT: &[u8] = b"[DiskFS v2] FipSOs v2.7 Sistema de Archivos Persistente SATA AHCI activo!\nRegistro inicial guardado en LBA 64.\n";
+    if super::is_protected_mode() {
+        return Vec::new();
+    }
+    const INITIAL_CONTENT: &[u8] = b"[DiskFS v2] FipSOs v6.3 Framekernel Sistema de Archivos Persistente activo!\nRegistro inicial guardado en LBA 64.\n";
 
     // 1. Superblock (LBA 0)
     let mut sb_buf = [0u8; 512];
@@ -70,12 +73,15 @@ pub(crate) fn format_and_create_initial() -> Vec<DiskFsFile> {
         return Vec::new();
     }
 
+    let backend = ostd::storage::active_backend_name();
     ostd::early_println!(
-        "[DiskFS] Disco SATA formateado con Superbloque \"FIPSOS_DISKFS_V2\" (128 inodos, Bitmap 4KB) | Creado \"{}\"",
+        "[DiskFS] Disco {} formateado con Superbloque \"FIPSOS_DISKFS_V2\" (128 inodos, Bitmap 4KB) | Creado \"{}\"",
+        backend,
         PATH_BOOT_LOG
     );
     ostd::fb_println!(
-        "[DiskFS] Disco SATA formateado (DiskFS v2 OK) | Creado \"{}\"",
+        "[DiskFS] Disco {} formateado (DiskFS v2 OK) | Creado \"{}\"",
+        backend,
         PATH_BOOT_LOG
     );
 
@@ -95,8 +101,11 @@ pub(crate) fn format_and_create_initial() -> Vec<DiskFsFile> {
 
 /// Creates a persistent directory in DiskFS.
 pub fn create_directory(path: &str) -> Result<(), &'static str> {
-    if !ostd::storage::is_ahci_ready() {
-        return Err("Controlador SATA AHCI no disponible");
+    if super::is_protected_mode() {
+        return Ok(());
+    }
+    if !ostd::storage::is_storage_ready() {
+        return Err("Controlador de almacenamiento (AHCI/NVMe) no disponible");
     }
 
     let norm_path = normalize_disk_path(path);
@@ -168,8 +177,11 @@ pub fn create_directory(path: &str) -> Result<(), &'static str> {
 
 /// Deletes a persistent directory in DiskFS.
 pub fn delete_directory(path: &str) -> Result<(), &'static str> {
-    if !ostd::storage::is_ahci_ready() {
-        return Err("Controlador SATA AHCI no disponible");
+    if super::is_protected_mode() {
+        return Ok(());
+    }
+    if !ostd::storage::is_storage_ready() {
+        return Err("Controlador de almacenamiento (AHCI/NVMe) no disponible");
     }
 
     let norm_path = normalize_disk_path(path);
@@ -233,8 +245,11 @@ pub fn delete_directory(path: &str) -> Result<(), &'static str> {
 /// Persists a file into the SATA AHCI disk, allocating sectors via the block bitmap
 /// and synchronizing its inode entry and superblock.
 pub fn save_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
-    if !ostd::storage::is_ahci_ready() {
-        return Err("Controlador SATA AHCI no disponible");
+    if super::is_protected_mode() {
+        return Ok(());
+    }
+    if !ostd::storage::is_storage_ready() {
+        return Err("Controlador de almacenamiento (AHCI/NVMe) no disponible");
     }
 
     let norm_path = normalize_disk_path(path);
@@ -360,7 +375,7 @@ pub fn save_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
 pub fn save_persistent_note(ticks: u64) -> Result<(), &'static str> {
     let ahci = ostd::storage::ahci_snapshot();
     let note_text = alloc::format!(
-        "[DiskFS v2] Nota persistente de usuario FipSOs v2.7\n\
+        "[DiskFS v2] Nota persistente de usuario FipSOs v6.3 Framekernel\n\
          Timestamp IRQ0: {} ticks\n\
          Dispositivo: Intel ICH9 SATA AHCI 00:1f.2 (Port {})\n\
          LBA Lecturas: {} sectores | LBA Escrituras: {} sectores\n\
@@ -376,10 +391,13 @@ pub fn save_persistent_note(ticks: u64) -> Result<(), &'static str> {
     save_file(PATH_PERSISTENT_NOTE, note_text.as_bytes())
 }
 
-/// Deletes a file from the SATA disk, recycling its LBA sectors in the bitmap.
+/// Deletes a file from the disk, recycling its LBA sectors in the bitmap.
 pub fn delete_file(path: &str) -> Result<(), &'static str> {
-    if !ostd::storage::is_ahci_ready() {
-        return Err("Controlador SATA AHCI no disponible");
+    if super::is_protected_mode() {
+        return Ok(());
+    }
+    if !ostd::storage::is_storage_ready() {
+        return Err("Controlador de almacenamiento (AHCI/NVMe) no disponible");
     }
 
     let norm_path = normalize_disk_path(path);

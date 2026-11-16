@@ -19,22 +19,19 @@ pub mod daemon;
 pub mod signals;
 pub mod slots;
 pub mod smp_idle;
+pub mod telemetry;
 
 pub use daemon::*;
 pub use signals::*;
 pub use slots::*;
 pub use smp_idle::*;
+pub use telemetry::*;
 
 /// Round-Robin scheduling quantum in `IRQ0` ticks (`10` ticks @ 100 Hz = `100 ms`).
 pub const QUANTUM_TICKS: u64 = 10;
 
 pub(crate) static ACTIVE_SLOT: AtomicU64 = AtomicU64::new(SLOT_SHELL);
-static PARENT_SLOT_STACK: [AtomicU64; 4] = [
-    AtomicU64::new(SLOT_SHELL),
-    AtomicU64::new(SLOT_SHELL),
-    AtomicU64::new(SLOT_SHELL),
-    AtomicU64::new(SLOT_SHELL),
-];
+static PARENT_SLOT_STACK: [AtomicU64; 16] = [const { AtomicU64::new(SLOT_SHELL) }; 16];
 static PARENT_SLOT_DEPTH: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) static SHELL_PID: AtomicU64 = AtomicU64::new(1033);
@@ -83,6 +80,25 @@ pub(crate) static BG_DOWNLOADER_PID: AtomicU64 = AtomicU64::new(1051);
 pub(crate) static BG_DOWNLOADER_TID: AtomicU64 = AtomicU64::new(1052);
 pub(crate) static BG_DOWNLOADER_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BG_DOWNLOADER_SWITCHES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BG_HTTPD_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(crate) static BG_HTTPD_PID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BG_HTTPD_PORT: AtomicU64 = AtomicU64::new(8080);
+
+/// Registers or updates the active background HTTP daemon PID and listening port.
+pub fn register_bg_httpd(pid: u64, port: u16) {
+    BG_HTTPD_PID.store(pid, Ordering::Release);
+    BG_HTTPD_PORT.store(port as u64, Ordering::Release);
+    BG_HTTPD_ACTIVE.store(true, Ordering::Release);
+}
+
+/// Returns `(active, pid, port)` for the background HTTP daemon.
+pub fn bg_httpd_status() -> (bool, u64, u16) {
+    (
+        BG_HTTPD_ACTIVE.load(Ordering::Acquire),
+        BG_HTTPD_PID.load(Ordering::Acquire),
+        BG_HTTPD_PORT.load(Ordering::Acquire) as u16,
+    )
+}
 
 pub(crate) static RING3_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TOTAL_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -141,19 +157,26 @@ pub fn set_slot_cr3(slot: u64, cr3_phys: u64) {
         SLOT_DESKTOP_UI => DESKTOP_UI_CR3.store(cr3_phys, Ordering::Release),
         _ => {}
     }
+    if let Some(mut table) = SCHEDULER_LOCK.try_lock() {
+        if let Some(entry) = table.iter_mut().find(|e| e.slot == slot) {
+            entry.cr3_phys = cr3_phys;
+        }
+    }
 }
 
 /// Invoked on every hardware `IRQ0` Timer Interrupt (`Vector 0x20`).
 pub fn on_timer_irq(frame: &InterruptStackFrame, total_ticks: u64) {
     CPU_CONTROLS[0].irq_ticks.fetch_add(1, Ordering::Relaxed);
-    CPU_CONTROLS[0].compute_ticks.fetch_add(1, Ordering::Relaxed);
+    if BSP_IDLE_HLT.load(Ordering::Relaxed) {
+        CPU_CONTROLS[0].idle_ticks.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CPU_CONTROLS[0].compute_ticks.fetch_add(1, Ordering::Relaxed);
+    }
     CPU_CONTROLS[0].total_switches.store(TOTAL_PREEMPTIONS.load(Ordering::Relaxed), Ordering::Relaxed);
-
-    // Non-blocking poll of network frames and TCP remote console on timer tick
-    crate::net::poll_network_and_remote_console();
 
     let is_ring3 = (frame.code_segment & 0b11) == 3;
     let current_slot = ACTIVE_SLOT.load(Ordering::Relaxed);
+    telemetry::bump_slot_tick(current_slot);
 
     if is_ring3 {
         RING3_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -173,11 +196,12 @@ pub fn on_timer_irq(frame: &InterruptStackFrame, total_ticks: u64) {
                 CHILD_RUST_RIP.store(frame.instruction_pointer, Ordering::Relaxed);
                 CHILD_RUST_RSP.store(frame.stack_pointer, Ordering::Relaxed);
             }
-            _ => {
+            SLOT_SHELL => {
                 SHELL_TICKS.fetch_add(1, Ordering::Relaxed);
                 SHELL_RIP.store(frame.instruction_pointer, Ordering::Relaxed);
                 SHELL_RSP.store(frame.stack_pointer, Ordering::Relaxed);
             }
+            _ => {}
         }
     } else if (total_ticks & 1) == 0 {
         match current_slot {
@@ -190,9 +214,10 @@ pub fn on_timer_irq(frame: &InterruptStackFrame, total_ticks: u64) {
             SLOT_CHILD_RUST => {
                 CHILD_RUST_TICKS.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {
+            SLOT_SHELL => {
                 SHELL_TICKS.fetch_add(1, Ordering::Relaxed);
             }
+            _ => {}
         }
     }
 
@@ -217,9 +242,6 @@ pub fn on_timer_irq(frame: &InterruptStackFrame, total_ticks: u64) {
             _ => {
                 SHELL_SWITCHES.fetch_add(1, Ordering::Relaxed);
             }
-        }
-        if DAEMON_ACTIVE.load(Ordering::Relaxed) {
-            switch_to_daemon_once();
         }
     }
 }
@@ -325,15 +347,41 @@ pub fn on_exit_child(exit_rip: u64) -> (u64, u64) {
     }
     CPU_CONTROLS[0].active_proc_slot.store(resumed_parent, Ordering::Release);
     let mut table = SCHEDULER_LOCK.lock();
-    if let Some(entry) = table.iter_mut().find(|e| e.slot == prev_slot) {
-        entry.is_running = false;
-        entry.state = TaskSlotState::Free;
+    if prev_slot != resumed_parent {
+        mark_slot_reclaimed_external(prev_slot);
+        reset_slot_ticks(prev_slot);
+        match prev_slot {
+            SLOT_DESKTOP_UI => DESKTOP_UI_CR3.store(0, Ordering::Release),
+            SLOT_CHILD_CPP => CHILD_CPP_CR3.store(0, Ordering::Release),
+            SLOT_CHILD_RUST => CHILD_RUST_CR3.store(0, Ordering::Release),
+            _ => {}
+        }
+        if let Some(entry) = table.iter_mut().find(|e| e.slot == prev_slot) {
+            entry.is_running = false;
+            entry.state = TaskSlotState::Free;
+            entry.pid = 0;
+            entry.ppid = 0;
+            entry.name = [0; 32];
+            entry.name_len = 0;
+            entry.cr3_phys = 0;
+        }
     }
     if let Some(entry) = table.iter_mut().find(|e| e.slot == resumed_parent) {
         entry.is_running = true;
         entry.state = TaskSlotState::Running;
     }
     (prev_slot, resumed_parent)
+}
+
+/// Returns the parent slot most recently saved on `PARENT_SLOT_STACK` (for `SpawnChild`).
+pub fn stacked_parent_slot() -> u64 {
+    let cur_depth = PARENT_SLOT_DEPTH.load(Ordering::Acquire);
+    if cur_depth > 0 {
+        let idx = ((cur_depth - 1) as usize).min(PARENT_SLOT_STACK.len() - 1);
+        PARENT_SLOT_STACK[idx].load(Ordering::Acquire)
+    } else {
+        SLOT_SHELL
+    }
 }
 
 /// Handles a cooperative `sys_sched_yield` (`24`) from Ring 3 by executing a real assembly

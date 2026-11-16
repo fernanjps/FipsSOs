@@ -332,4 +332,43 @@ pub fn _print(args: fmt::Arguments<'_>) {
     }
     let mut guard = FB_CONSOLE.lock();
     let _ = guard.write_fmt(args);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// Flushes the console view immediately when in boot/text console mode (`!DESKTOP_MODE`).
+pub fn flush_console() {
+    if DESKTOP_MODE.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(mut guard) = FB_CONSOLE.try_lock() {
+        guard.scroll_offset = 0;
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+}
+
+/// Forces exit from Desktop compositor mode and flushes the framebuffer console during panic.
+pub fn flush() {
+    DESKTOP_MODE.store(false, Ordering::Release);
+    with_console(|console| {
+        console.redraw_view();
+    });
+}
+
+/// Forcibly unlocks `FB_CONSOLE` (only for fatal Ring 0 exceptions/panics so output never deadlocks).
+pub fn emergency_force_unlock() {
+    DESKTOP_MODE.store(false, Ordering::Release);
+    // SAFETY: Emergency panic/exception path forces release of stuck lock before diagnostic rendering.
+    unsafe {
+        FB_CONSOLE.force_unlock();
+    }
+}
+
+/// Prints a panic banner directly to the linear framebuffer, bypassing `DESKTOP_MODE` and locks.
+pub fn write_panic_banner(args: fmt::Arguments<'_>) {
+    emergency_force_unlock();
+    with_console(|console| {
+        console.scroll_offset = 0;
+        let _ = console.write_fmt(args);
+        console.redraw_view();
+    });
 }

@@ -3,6 +3,29 @@ use limine::memory_map::{Entry, EntryType};
 
 use super::{phys_to_virt, PhysAddr, PAGE_SIZE};
 
+/// Maximum physical address tracked by the bitmap allocator (32 GiB).
+const MAX_TRACKED_PHYS_ADDR: u64 = 32 * 1024 * 1024 * 1024;
+/// Protect low physical memory (< 1 MiB) including IVT/BIOS areas and the 0x8000 SMP AP trampoline.
+const MIN_ALLOCATABLE_FRAME: usize = (1024 * 1024) / PAGE_SIZE;
+
+fn e820_type_label(entry_type: EntryType) -> &'static str {
+    if entry_type == EntryType::USABLE {
+        "USABLE"
+    } else if entry_type == EntryType::RESERVED {
+        "RESERVED"
+    } else if entry_type == EntryType::ACPI_RECLAIMABLE {
+        "ACPI_RECLAIMABLE"
+    } else if entry_type == EntryType::ACPI_NVS {
+        "ACPI_NVS"
+    } else if entry_type == EntryType::BOOTLOADER_RECLAIMABLE {
+        "BOOTLOADER_RECLAIMABLE"
+    } else if entry_type == EntryType::FRAMEBUFFER {
+        "FRAMEBUFFER"
+    } else {
+        "FIRMWARE/KERNEL"
+    }
+}
+
 /// Snapshot of physical frame allocator statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryStats {
@@ -71,13 +94,31 @@ impl FrameAllocator {
     /// Initializes the bitmap frame allocator using Limine's physical memory map.
     fn init_from_memory_map(&mut self, memory_map: &[&Entry]) {
         let mut max_phys_addr: u64 = 0;
-        for entry in memory_map {
+        let mut total_e820_usable: u64 = 0;
+        for (idx, entry) in memory_map.iter().enumerate() {
+            let end = entry.base.saturating_add(entry.length);
+            crate::early_println!(
+                "[ostd::mm::e820] #{:02} base={:#012x} end={:#012x} ({} KiB) type={}",
+                idx,
+                entry.base,
+                end,
+                entry.length / 1024,
+                e820_type_label(entry.entry_type)
+            );
             if entry.entry_type == EntryType::USABLE {
-                let end = entry.base + entry.length;
+                total_e820_usable = total_e820_usable.saturating_add(entry.length);
                 if end > max_phys_addr {
                     max_phys_addr = end;
                 }
             }
+        }
+        if max_phys_addr > MAX_TRACKED_PHYS_ADDR {
+            crate::early_println!(
+                "[ostd::mm::e820] Limite bitmap 32 GiB (fisico maximo firmware={:#x}, usable={} MiB)",
+                max_phys_addr,
+                total_e820_usable / (1024 * 1024)
+            );
+            max_phys_addr = MAX_TRACKED_PHYS_ADDR;
         }
 
         let max_frames = (max_phys_addr as usize).div_ceil(PAGE_SIZE);
@@ -86,16 +127,21 @@ impl FrameAllocator {
         let bitmap_frames = bitmap_bytes.div_ceil(PAGE_SIZE);
         let bitmap_size_aligned = (bitmap_frames * PAGE_SIZE) as u64;
 
-        // Locate a USABLE region (avoiding physical frame 0) large enough to host the bitmap
+        // Locate a USABLE region (>= 1 MiB preferred to protect BIOS/trampoline) large enough for the bitmap
         let mut bitmap_phys_base: Option<u64> = None;
-        for entry in memory_map {
-            if entry.entry_type == EntryType::USABLE {
-                let start = entry.base.max(PAGE_SIZE as u64);
-                let end = entry.base + entry.length;
-                if end > start && (end - start) >= bitmap_size_aligned {
-                    bitmap_phys_base = Some(start);
-                    break;
+        for min_base in [(1024 * 1024) as u64, PAGE_SIZE as u64] {
+            for entry in memory_map {
+                if entry.entry_type == EntryType::USABLE && entry.base < max_phys_addr {
+                    let start = entry.base.max(min_base);
+                    let end = entry.base.saturating_add(entry.length).min(max_phys_addr);
+                    if end > start && (end - start) >= bitmap_size_aligned {
+                        bitmap_phys_base = Some(start);
+                        break;
+                    }
                 }
+            }
+            if bitmap_phys_base.is_some() {
+                break;
             }
         }
 
@@ -116,20 +162,19 @@ impl FrameAllocator {
         self.max_frames = max_frames;
         self.total_usable_frames = 0;
         self.free_frames = 0;
-        self.search_hint_word = 0;
+        self.search_hint_word = MIN_ALLOCATABLE_FRAME / 64;
 
-        // Free all frames belonging to USABLE memory regions
+        // Free frames belonging to USABLE memory regions (>= 1 MiB to preserve trampoline/IVT)
         for entry in memory_map {
-            if entry.entry_type == EntryType::USABLE {
-                let start_frame = (entry.base as usize).div_ceil(PAGE_SIZE);
-                let end_frame = ((entry.base + entry.length) as usize) / PAGE_SIZE;
+            if entry.entry_type == EntryType::USABLE && entry.base < max_phys_addr {
+                let start_frame = ((entry.base as usize).div_ceil(PAGE_SIZE)).max(MIN_ALLOCATABLE_FRAME);
+                let capped_end = entry.base.saturating_add(entry.length).min(max_phys_addr);
+                let end_frame = ((capped_end as usize) / PAGE_SIZE).min(self.max_frames);
                 for frame_idx in start_frame..end_frame {
-                    if frame_idx > 0 && frame_idx < self.max_frames {
-                        if self.is_frame_allocated(frame_idx) {
-                            self.set_frame_free(frame_idx);
-                            self.total_usable_frames += 1;
-                            self.free_frames += 1;
-                        }
+                    if self.is_frame_allocated(frame_idx) {
+                        self.set_frame_free(frame_idx);
+                        self.total_usable_frames += 1;
+                        self.free_frames += 1;
                     }
                 }
             }
@@ -176,8 +221,12 @@ impl FrameAllocator {
         if let Some(found) = self.scan_range(hint_frame, self.max_frames, count) {
             return Some(found);
         }
-        if hint_frame > 0 {
-            return self.scan_range(1, (hint_frame + count).min(self.max_frames), count);
+        if hint_frame > MIN_ALLOCATABLE_FRAME {
+            return self.scan_range(
+                MIN_ALLOCATABLE_FRAME,
+                (hint_frame + count).min(self.max_frames),
+                count,
+            );
         }
         let _ = total_words;
         None
@@ -219,7 +268,7 @@ impl FrameAllocator {
     pub fn deallocate_contiguous(&mut self, base_paddr: PhysAddr, count: usize) {
         let start_frame = (base_paddr as usize) / PAGE_SIZE;
         for idx in start_frame..(start_frame + count) {
-            if idx > 0 && idx < self.max_frames && self.is_frame_allocated(idx) {
+            if idx >= MIN_ALLOCATABLE_FRAME && idx < self.max_frames && self.is_frame_allocated(idx) {
                 self.set_frame_free(idx);
                 self.free_frames += 1;
             }
@@ -243,18 +292,20 @@ static FRAME_LOCK: AtomicBool = AtomicBool::new(false);
 static mut GLOBAL_FRAME_ALLOCATOR: FrameAllocator = FrameAllocator::empty();
 
 fn with_allocator<R>(f: impl FnOnce(&mut FrameAllocator) -> R) -> R {
-    while FRAME_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
+    crate::arch::without_interrupts(|| {
+        while FRAME_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
 
-    // SAFETY: Protected by `FRAME_LOCK` atomic spinlock.
-    let result = unsafe { f(&mut *(&raw mut GLOBAL_FRAME_ALLOCATOR)) };
+        // SAFETY: Protected by `FRAME_LOCK` atomic spinlock with local IRQs masked.
+        let result = unsafe { f(&mut *(&raw mut GLOBAL_FRAME_ALLOCATOR)) };
 
-    FRAME_LOCK.store(false, Ordering::Release);
-    result
+        FRAME_LOCK.store(false, Ordering::Release);
+        result
+    })
 }
 
 pub(crate) fn init(memory_map: &[&Entry]) {
@@ -282,7 +333,120 @@ pub fn deallocate_frame(paddr: PhysAddr) {
     deallocate_contiguous_frames(paddr, 1);
 }
 
+/// Alias explícito para liberar un marco físico de 4 KiB hacia el bitmap global.
+#[inline]
+pub fn dealloc_frame(paddr: PhysAddr) {
+    deallocate_frame(paddr);
+}
+
 /// Returns current physical memory allocation statistics.
 pub fn stats() -> MemoryStats {
     with_allocator(|alloc| alloc.stats())
+}
+
+/// Resultado de una sonda en vivo de lectura/escritura directa en RAM física (HHDM).
+#[derive(Debug, Clone, Copy)]
+pub struct RamProbeStats {
+    pub pages_tested: u32,
+    pub bytes_tested: u64,
+    pub tsc_cycles: u64,
+    pub mbps: u32,
+}
+
+static LAST_RAM_RW_MBPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LAST_RAM_RW_PAGES_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Devuelve `(ultimo_mbps, ultimas_paginas_verificadas)` de la sonda RAM R/W más reciente.
+#[inline]
+pub fn last_ram_probe_stats() -> (u32, u32) {
+    (
+        LAST_RAM_RW_MBPS.load(Ordering::Acquire),
+        LAST_RAM_RW_PAGES_OK.load(Ordering::Acquire),
+    )
+}
+
+#[inline]
+fn ram_probe_word_pattern(paddr: PhysAddr, page_idx: usize, word_idx: usize) -> u64 {
+    let salt = paddr
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ (page_idx as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    salt ^ ((word_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ 0xA55A_5AA5_F00D_CAFE
+}
+
+/// Asigna `num_pages` marcos físicos reales de 4 KiB, escribe y verifica patrones de 64 bits
+/// directamente vía HHDM midiendo ciclos TSC reales, y libera cada marco sin fugas.
+pub fn live_ram_rw_probe(num_pages: usize) -> Result<RamProbeStats, &'static str> {
+    if num_pages == 0 || num_pages > 2048 {
+        return Err("live_ram_rw_probe: num_pages fuera de rango (1..=2048)");
+    }
+
+    let mut frames: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::with_capacity(num_pages);
+    for _ in 0..num_pages {
+        if let Some(pa) = allocate_frame() {
+            frames.push(pa);
+        } else {
+            for &pa in frames.iter().rev() {
+                dealloc_frame(pa);
+            }
+            return Err("live_ram_rw_probe: sin marcos fisicos libres suficientes");
+        }
+    }
+
+    let t0 = crate::time::read_tsc();
+    for (page_idx, &pa) in frames.iter().enumerate() {
+        let virt = super::phys_to_virt(pa) as *mut u64;
+        // SAFETY: `pa` es un marco físico de 4 KiB recién asignado y de propiedad exclusiva,
+        // mapeado linealmente en el HHDM; escribimos exactamente 512 u64 (4096 bytes).
+        unsafe {
+            for w in 0..(PAGE_SIZE / 8) {
+                virt.add(w).write_volatile(ram_probe_word_pattern(pa, page_idx, w));
+            }
+        }
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    let mut mismatch = false;
+    for (page_idx, &pa) in frames.iter().enumerate() {
+        let virt = super::phys_to_virt(pa) as *const u64;
+        // SAFETY: `pa` sigue siendo de propiedad exclusiva hasta liberar al final de esta función;
+        // leemos exactamente 512 u64 dentro del marco de 4096 bytes.
+        unsafe {
+            for w in 0..(PAGE_SIZE / 8) {
+                let got = virt.add(w).read_volatile();
+                if got != ram_probe_word_pattern(pa, page_idx, w) {
+                    mismatch = true;
+                    break;
+                }
+            }
+        }
+        if mismatch {
+            break;
+        }
+    }
+    let t1 = crate::time::read_tsc();
+
+    for &pa in frames.iter().rev() {
+        dealloc_frame(pa);
+    }
+
+    if mismatch {
+        return Err("live_ram_rw_probe: discrepancia de datos al verificar RAM fisica");
+    }
+
+    let cycles = t1.saturating_sub(t0).max(1);
+    let bytes_tested = (num_pages as u64) * (PAGE_SIZE as u64);
+    let rw_bytes = bytes_tested.saturating_mul(2);
+    let hz = crate::time::tsc_hz().max(1_000_000);
+    let bytes_per_sec = ((rw_bytes as u128).saturating_mul(hz as u128)) / (cycles as u128);
+    let mbps = ((bytes_per_sec / (1024 * 1024)).clamp(1, u32::MAX as u128)) as u32;
+
+    LAST_RAM_RW_MBPS.store(mbps, Ordering::Release);
+    LAST_RAM_RW_PAGES_OK.store(num_pages as u32, Ordering::Release);
+
+    Ok(RamProbeStats {
+        pages_tested: num_pages as u32,
+        bytes_tested,
+        tsc_cycles: cycles,
+        mbps,
+    })
 }

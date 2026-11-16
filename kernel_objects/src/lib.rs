@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod capability;
 pub mod channel;
 pub mod executor;
 pub mod handle;
@@ -13,6 +14,11 @@ pub mod object;
 pub mod process;
 pub mod thread;
 pub mod vmo;
+
+pub use capability::{
+    CapabilityFlags, CAP_ALL, CAP_FS_READ, CAP_FS_WRITE, CAP_NET, CAP_RAW_FB, CAP_SPAWN,
+    SANDBOX_AUTO_REAP, SANDBOX_RESTRICT_FAT0,
+};
 
 pub use channel::{
     Channel, ChannelError, ChannelReadFuture, MessagePacket, MAX_CHANNEL_MSG_BYTES,

@@ -13,16 +13,26 @@ constexpr uint64_t SYS_BRK         = 12;
 constexpr uint64_t SYS_IOCTL       = 16;
 constexpr uint64_t SYS_SCHED_YIELD = 24;
 constexpr uint64_t SYS_GETPID      = 39;
+constexpr uint64_t SYS_DUP         = 32;
+constexpr uint64_t SYS_DUP2        = 33;
+constexpr uint64_t SYS_NANOSLEEP   = 35;
 constexpr uint64_t SYS_EXECVE      = 59;
 constexpr uint64_t SYS_EXIT        = 60;
 constexpr uint64_t SYS_KILL        = 62;
 constexpr uint64_t SYS_UNLINK      = 87;
 constexpr uint64_t SYS_REBOOT      = 169;
+constexpr uint64_t SYS_GETDENTS64  = 217;
 constexpr uint64_t SYS_CLOCK_GETTIME = 228;
+constexpr uint64_t SYS_OPENAT      = 257;
 constexpr uint64_t SYS_SOCKET       = 41;
 constexpr uint64_t SYS_CONNECT      = 42;
 constexpr uint64_t SYS_SENDTO       = 44;
 constexpr uint64_t SYS_RECVFROM     = 45;
+
+constexpr int64_t AT_FDCWD          = -100;
+constexpr uint8_t DT_CHR            = 2;
+constexpr uint8_t DT_DIR            = 4;
+constexpr uint8_t DT_REG            = 8;
 
 constexpr int32_t AF_INET           = 2;
 constexpr int32_t SOCK_STREAM       = 1;
@@ -35,7 +45,9 @@ constexpr uint32_t LINUX_REBOOT_MAGIC2 = 672274793;
 constexpr uint32_t LINUX_REBOOT_CMD_RESTART = 0x01234567;
 constexpr uint32_t LINUX_REBOOT_CMD_POWER_OFF = 0x4321FEDC;
 
+constexpr uint64_t FD_STDIN        = 0;
 constexpr uint64_t FD_STDOUT       = 1;
+constexpr uint64_t FD_STDERR       = 2;
 constexpr uint64_t O_RDONLY        = 0;
 constexpr uint64_t O_WRONLY        = 1;
 constexpr uint64_t O_RDWR          = 2;
@@ -72,7 +84,63 @@ constexpr uint64_t VFS_IOCTL_TASK_CONTROL     = 0xC0105003ULL;
 constexpr uint64_t VFS_IOCTL_LIST_FILES       = 0xC0105601ULL;
 constexpr uint64_t VFS_IOCTL_LIST_PROCESSES   = 0xC0105001ULL;
 constexpr uint64_t VFS_IOCTL_HWMON_REPORT     = 0xC0105002ULL;
-constexpr uint64_t VFS_IOCTL_SYS_TELEMETRY    = 0xC0105301ULL;
+constexpr uint64_t VFS_IOCTL_SYS_TELEMETRY         = 0xC0105301ULL;
+constexpr uint64_t VFS_IOCTL_BG_HTTPD_INFO         = 0xC0105303ULL;
+constexpr uint64_t FIPSOS_IOCTL_LIVE_KERNEL_TELEMETRY = 0xC0105304ULL;
+constexpr uint64_t FIPSOS_IOCTL_RAM_RW_PROBE       = 0xC0105305ULL;
+
+struct LiveCoreTelemetry {
+    uint64_t active_ticks;
+    uint64_t idle_ticks;
+    uint64_t irq_count;
+    uint32_t apic_id;
+    uint32_t online;
+};
+
+struct LiveProcTelemetry {
+    uint64_t pid;
+    uint64_t tid;
+    uint64_t cr3_phys;
+    uint32_t slot_id;
+    uint32_t state; // 0=Free, 1=Ready, 2=Running, 3=Blocked, 4=Zombie, 5=Exited
+    uint32_t user_pages;
+    uint32_t ticks;
+    char     name[16];
+};
+
+struct FipsosLiveTelemetry {
+    uint64_t total_frames;
+    uint64_t used_frames;
+    uint64_t free_frames;
+    uint64_t heap_used_bytes;
+    uint64_t heap_total_bytes;
+    uint64_t irq0_ticks;
+    uint32_t last_ram_rw_mbps;
+    uint32_t last_ram_rw_pages_ok;
+    uint32_t online_cores;
+    uint32_t active_procs;
+    LiveCoreTelemetry cores[8];
+    LiveProcTelemetry procs[8];
+};
+
+struct RamProbeRequest {
+    uint64_t num_pages;
+    uint64_t bytes_tested;
+    uint64_t tsc_cycles;
+    uint32_t mbps;
+    uint32_t pages_ok;
+};
+
+static_assert(sizeof(LiveCoreTelemetry) == 32, "LiveCoreTelemetry ABI mismatch");
+static_assert(sizeof(LiveProcTelemetry) == 56, "LiveProcTelemetry ABI mismatch");
+static_assert(sizeof(FipsosLiveTelemetry) == 768, "FipsosLiveTelemetry ABI mismatch");
+static_assert(sizeof(RamProbeRequest) == 32, "RamProbeRequest ABI mismatch");
+
+struct BgHttpdInfo {
+    uint64_t active;
+    uint64_t pid;
+    uint64_t port;
+};
 
 constexpr uint8_t MOUSE_BTN_LEFT   = 0x01;
 constexpr uint8_t MOUSE_BTN_RIGHT  = 0x02;
@@ -240,8 +308,32 @@ inline int64_t sys_open(const char* path_cstr, uint64_t flags) noexcept {
     return syscall3(SYS_OPEN, reinterpret_cast<uint64_t>(path_cstr), flags, 0);
 }
 
+inline int64_t sys_openat(int64_t dirfd, const char* path_cstr, uint64_t flags, uint64_t mode = 0) noexcept {
+    return syscall6(
+        SYS_OPENAT,
+        static_cast<uint64_t>(dirfd),
+        reinterpret_cast<uint64_t>(path_cstr),
+        flags,
+        mode,
+        0,
+        0
+    );
+}
+
+inline int64_t sys_getdents64(uint64_t fd, void* dirp, size_t count) noexcept {
+    return syscall3(SYS_GETDENTS64, fd, reinterpret_cast<uint64_t>(dirp), static_cast<uint64_t>(count));
+}
+
 inline int64_t sys_close(uint64_t fd) noexcept {
     return syscall3(SYS_CLOSE, fd, 0, 0);
+}
+
+inline int64_t sys_dup(uint64_t oldfd) noexcept {
+    return syscall3(SYS_DUP, oldfd, 0, 0);
+}
+
+inline int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) noexcept {
+    return syscall3(SYS_DUP2, oldfd, newfd, 0);
 }
 
 inline uint64_t sys_brk(uint64_t new_addr) noexcept {
@@ -291,6 +383,10 @@ inline int64_t sys_execve(const char* path_cstr) noexcept {
     return syscall3(SYS_EXECVE, reinterpret_cast<uint64_t>(path_cstr), 0, 0);
 }
 
+inline int64_t sys_execve_args(const char* path_cstr, const char* const* argv) noexcept {
+    return syscall3(SYS_EXECVE, reinterpret_cast<uint64_t>(path_cstr), reinterpret_cast<uint64_t>(argv), 0);
+}
+
 [[noreturn]] inline void sys_exit(int32_t status) noexcept {
     syscall3(SYS_EXIT, static_cast<uint64_t>(status), 0, 0);
     __builtin_unreachable();
@@ -302,6 +398,10 @@ inline int64_t sys_reboot(uint32_t magic1, uint32_t magic2, uint32_t cmd, uint64
 
 inline int64_t sys_clock_gettime(int32_t clk_id, Timespec* tp) noexcept {
     return syscall3(SYS_CLOCK_GETTIME, static_cast<uint64_t>(clk_id), reinterpret_cast<uint64_t>(tp), 0);
+}
+
+inline int64_t sys_nanosleep(const Timespec* req, Timespec* rem = nullptr) noexcept {
+    return syscall3(SYS_NANOSLEEP, reinterpret_cast<uint64_t>(req), reinterpret_cast<uint64_t>(rem), 0);
 }
 
 struct InAddr {

@@ -219,13 +219,6 @@ impl Elf64Loader {
             entry_point,
             phdr_vaddr
         );
-        ostd::fb_println!(
-            "[linux_abi::elf] Binario ELF64 x86_64 cargado con W^X ({} segmento(s) PT_LOAD, {} bytes) -> EntryPoint={:#x} PHDR={:#x}",
-            segments_loaded,
-            total_mapped_bytes,
-            entry_point,
-            phdr_vaddr
-        );
 
         Ok(LoadedElf64 {
             entry_point,

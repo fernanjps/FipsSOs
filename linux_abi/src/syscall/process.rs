@@ -8,56 +8,16 @@ use ostd::mm::{active_cr3, reset_user_brk, switch_cr3};
 
 use crate::elf::Elf64Loader;
 use crate::vfs::clone_process_fds;
-use super::{resolve_path, ACTIVE_PROGRAM_NAME, GLOBAL_VFS, ARCH_GET_FS, ARCH_SET_FS};
-
-/// Linux `sys_arch_prctl` (syscall 158): sets or gets architectural processor state (`MSR_IA32_FS_BASE` TLS).
-pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
-    match code {
-        ARCH_SET_FS => {
-            ostd::arch::syscall::set_user_fs_base(addr);
-            0
-        }
-        ARCH_GET_FS => {
-            let fs = ostd::arch::syscall::get_user_fs_base();
-            if write_user_bytes(addr, &fs.to_le_bytes()).is_err() {
-                -14 // -EFAULT
-            } else {
-                0
-            }
-        }
-        _ => -22, // -EINVAL
-    }
-}
-
-
-/// Linux `sys_set_tid_address` (syscall 218): sets the clear_child_tid pointer and returns the thread TID.
-pub fn sys_set_tid_address(_tidptr: u64) -> i64 {
-    let (_pid, tid) = ostd::scheduler::active_pid_and_tid();
-    tid as i64
-}
-
-
-/// Linux `sys_nanosleep` (syscall 35): pauses execution for the requested duration.
-pub fn sys_nanosleep(req_addr: u64, _rem_addr: u64) -> i64 {
-    let mut buf = [0u8; 16];
-    if read_user_bytes(req_addr, &mut buf).is_err() {
-        return -14;
-    }
-    let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let ticks_to_sleep = (sec * 100).saturating_add(nsec / 10_000_000).max(1);
-    let start_ticks = ostd::arch::idt::timer_ticks();
-    while ostd::arch::idt::timer_ticks().saturating_sub(start_ticks) < (ticks_to_sleep as u64) {
-        ostd::scheduler::on_sys_sched_yield(0, 0);
-    }
-    0
-}
-
+use super::{resolve_path, set_active_program_name, GLOBAL_VFS};
 
 /// Linux `sys_fork` (syscall 57): duplicates the calling process by creating a new PML4 with
 /// complete Lower-Half memory isolation, registering the child in the scheduler, and returning
 /// `child_pid` to the parent and `0` to the child.
 pub fn sys_fork(_frame: &TrapFrame) -> SyscallAction {
+    if let Err(e) = super::sandbox::check_spawn_sandbox() {
+        return SyscallAction::Continue(e as u64);
+    }
+    super::fs::reclaim_dead_process_fds();
     let parent_cr3 = active_cr3();
     let parent_pid = ostd::scheduler::active_pid();
 
@@ -85,16 +45,10 @@ pub fn sys_fork(_frame: &TrapFrame) -> SyscallAction {
         parent_cr3,
         child_cr3
     );
-    ostd::fb_println!(
-        "[linux_abi::fork] sys_fork() -> PID={} (Slot={}) | CR3 {:#x} -> {:#x}",
-        child_pid,
-        child_slot,
-        parent_cr3,
-        child_cr3
-    );
 
     let parent_slot = ostd::scheduler::active_slot();
     clone_process_fds(parent_slot, child_slot);
+    crate::container::on_process_fork(crate::vfs::get_process_container_id(child_slot));
 
     SyscallAction::ForkChild {
         child_pid,
@@ -109,6 +63,10 @@ pub fn sys_fork(_frame: &TrapFrame) -> SyscallAction {
 /// Linux `sys_clone` (syscall 56): clone process or thread. When creating a process (without CLONE_VM),
 /// performs full PML4 duplication with Lower-Half isolation.
 pub fn sys_clone(flags: u64, newsp: u64, _frame: &TrapFrame) -> SyscallAction {
+    if let Err(e) = super::sandbox::check_spawn_sandbox() {
+        return SyscallAction::Continue(e as u64);
+    }
+    super::fs::reclaim_dead_process_fds();
     let parent_cr3 = active_cr3();
     let parent_pid = ostd::scheduler::active_pid();
 
@@ -139,6 +97,7 @@ pub fn sys_clone(flags: u64, newsp: u64, _frame: &TrapFrame) -> SyscallAction {
 
     let parent_slot = ostd::scheduler::active_slot();
     clone_process_fds(parent_slot, child_slot);
+    crate::container::on_process_fork(crate::vfs::get_process_container_id(child_slot));
 
     SyscallAction::ForkChild {
         child_pid,
@@ -157,8 +116,13 @@ pub fn sys_wait4(target_pid: i64, status_addr: u64, options: u64, _rusage: u64) 
 
     let mut attempts = 0;
     loop {
+        super::fs::reclaim_dead_process_fds();
         match ostd::scheduler::collect_zombie_child(parent_pid, target_pid) {
-            Ok((collected_pid, exit_status)) => {
+            Ok((collected_pid, exit_status, collected_slot, _residual_cr3)) => {
+                if collected_slot >= 2 {
+                    super::fs::finish_orphan_nodes(crate::vfs::cleanup_process_fds(collected_slot));
+                }
+                super::fs::reclaim_dead_process_fds();
                 if status_addr != 0 {
                     let _ = write_user_bytes(status_addr, &exit_status.to_le_bytes());
                 }
@@ -168,11 +132,6 @@ pub fn sys_wait4(target_pid: i64, status_addr: u64, options: u64, _rusage: u64) 
                     collected_pid,
                     exit_status,
                     (exit_status >> 8) & 0xff
-                );
-                ostd::fb_println!(
-                    "[linux_abi::wait4] Recolectado PID={} status={:#x}",
-                    collected_pid,
-                    exit_status
                 );
                 return collected_pid as i64;
             }
@@ -207,12 +166,6 @@ pub fn sys_sched_yield(user_rip: u64, user_rsp: u64) -> i64 {
             user_rip,
             switches
         );
-        ostd::fb_println!(
-            "[Scheduler::yield] sys_sched_yield() TID=koid:{} (RIP={:#x}) -> simd-worker (Sw={})",
-            tid,
-            user_rip,
-            switches
-        );
     }
     0
 }
@@ -222,12 +175,6 @@ pub fn sys_sched_yield(user_rip: u64, user_rsp: u64) -> i64 {
 pub fn sys_getpid(user_rip: u64) -> i64 {
     let (pid, tid) = ostd::scheduler::active_pid_and_tid();
     ostd::early_println!(
-        "[linux_abi::syscall] sys_getpid() -> PID=koid:{} (TID=koid:{}, RIP={:#x})",
-        pid,
-        tid,
-        user_rip
-    );
-    ostd::fb_println!(
         "[linux_abi::syscall] sys_getpid() -> PID=koid:{} (TID=koid:{}, RIP={:#x})",
         pid,
         tid,
@@ -259,39 +206,36 @@ pub fn sys_sched_getaffinity(_pid: i64, cpusetsize: usize, mask_ptr: u64) -> isi
 /// enforces strict `W^X` on its `PT_LOAD` segments, transitions the child `Process` & `Thread` in
 /// `SchedulerRegistry` to `Running`, and enters Ring 3 while stacking the parent process's `TrapFrame`.
 pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> SyscallAction {
-    let mut path_buf = [0u8; 128];
-    let mut path_len = 0usize;
-
-    for slot in &mut path_buf {
-        let mut byte = [0u8; 1];
-        if read_user_bytes(user_path_vaddr + (path_len as u64), &mut byte).is_err() {
-            return SyscallAction::Continue((-14i64) as u64); // -EFAULT
-        }
-        if byte[0] == 0 {
-            break;
-        }
-        *slot = byte[0];
-        path_len += 1;
+    if let Err(e) = super::sandbox::check_spawn_sandbox() {
+        return SyscallAction::Continue(e as u64);
     }
-
-    if path_len == 0 {
+    let path_owned = match super::fs_dir::read_user_cstr_path(user_path_vaddr) {
+        Ok(p) => p,
+        Err(e) => return SyscallAction::Continue(e as u64),
+    };
+    let path_str = path_owned.as_str();
+    if path_str.is_empty() {
         return SyscallAction::Continue((-2i64) as u64); // -ENOENT
     }
-
-    let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
-        return SyscallAction::Continue((-22i64) as u64); // -EINVAL
-    };
 
     let resolved = resolve_path(path_str);
     let mut elf_bytes = GLOBAL_VFS.lock().read_all_by_path(&resolved);
 
+    // Fallback for extensionless absolute path (e.g. /bin/sample_tool -> /bin/sample_tool.elf)
+    if elf_bytes.is_err() && path_str.starts_with('/') && !resolved.ends_with(".elf") {
+        let with_elf = alloc::format!("{}.elf", resolved);
+        if let Ok(bytes) = GLOBAL_VFS.lock().read_all_by_path(&with_elf) {
+            elf_bytes = Ok(bytes);
+        }
+    }
+
     // Sequential executable resolution in /bin and /disk/bin when relative
     if elf_bytes.is_err() && !path_str.starts_with('/') {
         let candidates = [
-            alloc::format!("/bin/{}", path_str),
-            alloc::format!("/bin/{}.elf", path_str),
-            alloc::format!("/disk/bin/{}", path_str),
-            alloc::format!("/disk/bin/{}.elf", path_str),
+            resolve_path(&alloc::format!("/bin/{}", path_str)),
+            resolve_path(&alloc::format!("/disk/bin/{}", path_str)),
+            resolve_path(&alloc::format!("/bin/{}.elf", path_str)),
+            resolve_path(&alloc::format!("/disk/bin/{}.elf", path_str)),
         ];
         let vfs = GLOBAL_VFS.lock();
         for cand in &candidates {
@@ -320,7 +264,7 @@ pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> Sy
             if str_vaddr == 0 {
                 break;
             }
-            let mut str_buf = [0u8; 128];
+            let mut str_buf = [0u8; 256];
             let mut str_len = 0usize;
             while str_len < str_buf.len() {
                 let mut b = [0u8; 1];
@@ -350,7 +294,8 @@ pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> Sy
         return SyscallAction::Continue((-8i64) as u64); // -ENOEXEC
     }
 
-    // 2. Save the caller's active PML4 for atomic rollback on failure
+    // 2. Reclaim dead children and save the caller's active PML4 for atomic rollback on failure
+    super::fs::reclaim_dead_process_fds();
     let parent_cr3 = active_cr3();
 
     let child_cr3 = match SchedulerRegistry::prepare_child_cr3(&resolved) {
@@ -365,12 +310,8 @@ pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> Sy
         Err(err) => {
             switch_cr3(parent_cr3);
             let _ = ostd::mm::destroy_process_vm_space(child_cr3);
+            SchedulerRegistry::abort_child_cr3(&resolved, child_cr3);
             ostd::early_println!(
-                "[linux_abi::execve] Error al cargar ELF64 \"{}\": {:?}",
-                resolved,
-                err
-            );
-            ostd::fb_println!(
                 "[linux_abi::execve] Error al cargar ELF64 \"{}\": {:?}",
                 resolved,
                 err
@@ -390,14 +331,23 @@ pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> Sy
         Err(_) => {
             switch_cr3(parent_cr3);
             let _ = ostd::mm::destroy_process_vm_space(child_cr3);
+            SchedulerRegistry::abort_child_cr3(&resolved, child_cr3);
             return SyscallAction::Continue((-12i64) as u64); // -ENOMEM
         }
     };
 
-    *ACTIVE_PROGRAM_NAME.lock() = resolved.clone();
-
+    // Inherit the caller's FD table, CWD, and capabilities into the exec'd slot.
+    let pre_exec_slot = ostd::scheduler::active_slot();
     let (child_pid, child_tid) =
         SchedulerRegistry::begin_child_exec(&resolved, loaded_elf.entry_point, child_rsp);
+    let exec_slot = ostd::scheduler::active_slot();
+    if exec_slot != pre_exec_slot {
+        clone_process_fds(pre_exec_slot, exec_slot);
+        crate::vfs::set_process_container_id(pre_exec_slot, 0);
+        ostd::scheduler::inherit_slot_capabilities(pre_exec_slot, exec_slot);
+    }
+    set_active_program_name(resolved.clone());
+    crate::container::refresh_current_container_pages();
 
     ostd::early_println!(
         "[linux_abi::execve] sys_execve(\"{}\", {} B) -> Proceso {} / Thread {} | CR3: {:#x} -> {:#x} | Entry={:#x} RSP={:#x} (Seg={})",
@@ -410,15 +360,6 @@ pub fn sys_execve(user_path_vaddr: u64, argv_vaddr: u64, _envp_vaddr: u64) -> Sy
         loaded_elf.entry_point,
         child_rsp,
         loaded_elf.segments_loaded
-    );
-    ostd::fb_println!(
-        "[linux_abi::execve] sys_execve(\"{}\") -> PID={} | CR3 {:#x} -> {:#x} | Entry={:#x} RSP={:#x}",
-        resolved,
-        child_pid,
-        parent_cr3,
-        child_cr3,
-        loaded_elf.entry_point,
-        child_rsp
     );
 
     SyscallAction::SpawnChild {
@@ -500,14 +441,15 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64, _sigsetsize: 
 /// Linux `sys_kill` (62) implementation for signaling or terminating a process/daemon.
 pub fn sys_kill(pid: u64, sig: u64) -> i64 {
     ostd::early_println!("[linux_abi::syscall] sys_kill(pid={}, sig={})", pid, sig);
-    ostd::fb_println!("[linux_abi::syscall] sys_kill(pid={}, sig={})", pid, sig);
 
     if sig >= 32 {
         return -22; // -EINVAL
     }
-    match ostd::scheduler::kill_task(pid, sig) {
+    let res = match ostd::scheduler::kill_task(pid, sig) {
         Ok(_) => 0,
         Err(err) => err,
-    }
+    };
+    super::fs::reclaim_dead_process_fds();
+    res
 }
 

@@ -1,6 +1,8 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+static HEAP_TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
 
@@ -42,6 +44,29 @@ impl FreeListHeap {
             (*initial_block).next = null_mut();
         }
         self.head = initial_block;
+        HEAP_TOTAL_BYTES.store(aligned_size, Ordering::Release);
+    }
+
+    /// Appends a freshly allocated HHDM memory block to the free list, coalescing adjacent ranges.
+    ///
+    /// # Safety
+    /// Caller must guarantee the region is valid, writable, exclusively owned, and mapped in HHDM.
+    pub unsafe fn add_region(&mut self, region_start: usize, region_size: usize) -> usize {
+        let aligned_start = align_up(region_start, core::mem::align_of::<FreeBlock>());
+        let usable_size = region_size.saturating_sub(aligned_start - region_start);
+        let aligned_size = usable_size & !(core::mem::align_of::<FreeBlock>() - 1);
+        if aligned_size < MIN_BLOCK_SIZE {
+            return 0;
+        }
+        // SAFETY: `aligned_size` satisfies `MIN_BLOCK_SIZE` and `FreeBlock` alignment.
+        let layout = unsafe {
+            Layout::from_size_align_unchecked(aligned_size, core::mem::align_of::<FreeBlock>())
+        };
+        // SAFETY: Inserts and coalesces the new memory region in address order.
+        unsafe {
+            self.deallocate(aligned_start as *mut u8, layout);
+        }
+        aligned_size
     }
 
     pub fn allocate(&mut self, layout: Layout) -> *mut u8 {
@@ -168,6 +193,22 @@ impl FreeListHeap {
             }
         }
     }
+
+    /// Sums the total free bytes currently available across the intrusive free list.
+    pub fn free_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut current = self.head;
+        let mut guard = 0usize;
+        while !current.is_null() && guard < 131_072 {
+            // SAFETY: `current` traverses blocks linked inside `self.head` while holding `LockedHeap`.
+            unsafe {
+                total = total.saturating_add((*current).size);
+                current = (*current).next;
+            }
+            guard += 1;
+        }
+        total
+    }
 }
 
 /// Spinlock-protected Global Heap Allocator for `ostd`.
@@ -208,7 +249,26 @@ impl LockedHeap {
 
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.with_lock(|heap| heap.allocate(layout))
+        let ptr = self.with_lock(|heap| heap.allocate(layout));
+        if !ptr.is_null() {
+            return ptr;
+        }
+        if super::is_initialized() {
+            let min_need = layout.size().saturating_add(layout.align()).max(super::PAGE_SIZE);
+            let grow_bytes = min_need.max(2 * 1024 * 1024);
+            let grow_frames = grow_bytes.div_ceil(super::PAGE_SIZE);
+            if let Some(phys) = super::frame::allocate_contiguous_frames(grow_frames) {
+                let virt = super::phys_to_virt(phys) as usize;
+                let actual_bytes = grow_frames * super::PAGE_SIZE;
+                return self.with_lock(|heap| {
+                    // SAFETY: `virt..virt+actual_bytes` is freshly allocated HHDM memory from `frame`.
+                    let added = unsafe { heap.add_region(virt, actual_bytes) };
+                    HEAP_TOTAL_BYTES.fetch_add(added, Ordering::AcqRel);
+                    heap.allocate(layout)
+                });
+            }
+        }
+        null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -223,6 +283,19 @@ static GLOBAL_HEAP: LockedHeap = LockedHeap::new();
 #[inline]
 const fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
+}
+
+#[inline]
+pub fn total_bytes() -> usize {
+    HEAP_TOTAL_BYTES.load(Ordering::Acquire)
+}
+
+/// Returns live `(used_bytes, total_bytes)` for the global kernel heap.
+pub fn stats() -> (usize, usize) {
+    let total = total_bytes();
+    let free = GLOBAL_HEAP.with_lock(|heap| heap.free_bytes());
+    let used = total.saturating_sub(free);
+    (used, total)
 }
 
 /// Initializes the global kernel heap allocator.

@@ -58,6 +58,7 @@ struct VmoRingHeader {
 
 #define VFS_IOCTL_LIST_PROCESSES      0xC0105001
 #define VFS_IOCTL_HWMON_REPORT        0xC0105002
+#define FIPSOS_IOCTL_MSR_GP_TEST      0xC0105306
 #define NET_IOCTL_PING_GATEWAY        0xC0104E01
 #define NET_IOCTL_HTTP_FETCH          0xC0104E02
 #define NET_IOCTL_BROWSER_FETCH_SAVE  0xC0104E03
@@ -66,7 +67,7 @@ struct VmoRingHeader {
 void print_banner(void) {
     static const char banner_msg[] =
         "\n\033[1;36m======================================================================\033[0m\n"
-        "\033[1;32m  FipSOs v3.5 Framekernel (x86_64 SMP | PCIe NVMe | USB xHCI DMA | Remote :2222)\033[0m\n"
+        "\033[1;32m  FipSOs v6.3 Framekernel (x86_64 SMP | Containers | FAT32 LBA 2048)\033[0m\n"
         "\033[1;33m  Polyglot Kernel: ASM + C11 + Rust + C++20 | System V ABI | Modular Shell\033[0m\n"
         "\033[1;35m  Boot: UEFI/BIOS Hybrid Bare-Metal Ready\033[0m\n"
         "\033[1;36m======================================================================\033[0m\n"
@@ -90,9 +91,13 @@ static void cmd_help(void) {
         "  \033[1;37muname [-a]\033[0m         - Informacion del sistema operativo y arquitectura\n"
         "  \033[1;37mnproc\033[0m              - Muestra el numero de procesadores/nucleos activos (SMP)\n"
         "  \033[1;37mps\033[0m                 - Lista procesos y tareas del planificador\n"
-        "  \033[1;37mfree / sensors\033[0m     - Telemetria de memoria, temperatura, NVMe y hardware\n"
+        "  \033[1;37mfree / mem / sensors\033[0m - Telemetria de memoria, temperatura, NVMe y hardware\n"
+        "  \033[1;37mai [--guard ...]\033[0m   - Motor IA SSE2 (/bin/fips_ai)\n"
+        "  \033[1;37mdocker <cmd>\033[0m       - Contenedores Kernel (images, run, ps, inspect, rm)\n"
         "  \033[1;37mclear\033[0m              - Limpia la pantalla de la consola\n"
         "  \033[1;37medit / kilo <file>\033[0m - Editor de texto modal a pantalla completa en C\n"
+        "  \033[1;37mlua [script.lua]\033[0m   - Interprete nativo Lua 5.4 (REPL o archivo)\n"
+        "  \033[1;37mtcc <src.c> -o bin\033[0m - Compilador C11 nativo (TinyCC -> ELF64 estatico)\n"
         "  \033[1;37mgui\033[0m                - Lanza el Compositor de Escritorio C++20\n"
         "  \033[1;37mbusybox [applet] [args]\033[0m - Binario multi-call BusyBox v1.35.0 estatico\n"
         "  \033[1;37mcmd1 | cmd2\033[0m        - Soporte de tuberias (pipes) con redireccion POSIX\n"
@@ -320,10 +325,24 @@ static void cmd_ps(void) {
     }
 }
 
+static void cmd_msr_test(void) {
+    int fb_fd = open("/dev/fb0", O_RDWR);
+    if (fb_fd >= 0) {
+        uint64_t out[4] = {0, 0, 0, 0};
+        long rc = ioctl(fb_fd, FIPSOS_IOCTL_MSR_GP_TEST, (unsigned long)out);
+        close(fb_fd);
+        printf("[MSR #GP SAFE TEST] rc=%ld before=%llu after=%llu (hwcr_ok=%llu therm_ok=%llu)\n",
+               rc, (unsigned long long)out[0], (unsigned long long)out[1],
+               (unsigned long long)out[2], (unsigned long long)out[3]);
+    } else {
+        printf("msrtest: no se puede abrir /dev/fb0\n");
+    }
+}
+
 static void cmd_sensors(void) {
     int fb_fd = open("/dev/fb0", O_RDWR);
     if (fb_fd >= 0) {
-        char report[2048];
+        char report[4096];
         memset(report, 0, sizeof(report));
         ioctl(fb_fd, VFS_IOCTL_HWMON_REPORT, (unsigned long)report);
         printf("%s\n", report);
@@ -336,9 +355,13 @@ static void cmd_sensors(void) {
 static void cmd_net_ping(void) {
     int net_fd = open("/dev/net/eth0", O_RDWR);
     if (net_fd >= 0) {
-        ioctl(net_fd, NET_IOCTL_PING_GATEWAY, 1);
+        int rc = ioctl(net_fd, NET_IOCTL_PING_GATEWAY, 1);
         close(net_fd);
-        printf("net: Ping ICMP/ARP a 10.0.2.2 completado con exito.\n");
+        if (rc >= 0) {
+            printf("net: Ping ICMP/ARP a 10.0.2.2 completado con exito.\n");
+        } else {
+            printf("net: Ping ICMP/ARP timeout o sin enlace (%d).\n", rc);
+        }
     } else {
         printf("net: no se puede abrir /dev/net/eth0\n");
     }
@@ -536,7 +559,8 @@ int handle_builtin(int argc, char** argv) {
     if (strcmp(cmd, "uname") == 0) { cmd_uname(); return 1; }
     if (strcmp(cmd, "ps") == 0) { cmd_ps(); return 1; }
     if (strcmp(cmd, "kill") == 0) { cmd_kill(argc, argv); return 1; }
-    if (strcmp(cmd, "free") == 0 || strcmp(cmd, "sensors") == 0 || strcmp(cmd, "hwmon") == 0) { cmd_sensors(); return 1; }
+    if (strcmp(cmd, "free") == 0 || strcmp(cmd, "mem") == 0 || strcmp(cmd, "sensors") == 0 || strcmp(cmd, "hwmon") == 0) { cmd_sensors(); return 1; }
+    if (strcmp(cmd, "msrtest") == 0) { cmd_msr_test(); return 1; }
     if (strcmp(cmd, "net") == 0 || strcmp(cmd, "ping") == 0) { cmd_net_ping(); return 1; }
     if (strcmp(cmd, "wget") == 0) { cmd_wget(argc > 1 ? argv[1] : NULL); return 1; }
     if (strcmp(cmd, "curl") == 0) { cmd_curl(argc > 1 ? argv[1] : NULL); return 1; }

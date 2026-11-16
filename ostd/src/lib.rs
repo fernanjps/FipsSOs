@@ -13,6 +13,7 @@ pub mod net;
 pub mod scheduler;
 pub mod storage;
 pub mod sync;
+pub mod time;
 pub mod user;
 
 use core::panic::PanicInfo;
@@ -89,5 +90,9 @@ fn panic(info: &PanicInfo) -> ! {
         user::sys_exit(101);
     }
     early_println!("\n[FipSOs PANIC] {}", info);
+    fb_console::emergency_force_unlock();
+    arch::serial::emergency_force_unlock();
+    fb_console::write_panic_banner(format_args!("\x1b[1;31m\n[FipSOs PANIC] {}\x1b[0m\n", info));
+    fb_console::flush();
     halt_loop()
 }

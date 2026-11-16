@@ -11,6 +11,7 @@ pub const FD_ACCEL_NPU0: u64 = 4;
 pub const FD_FB0: u64 = 5;
 pub const FD_MOUSE0: u64 = 6;
 pub const FD_NET0: u64 = 7;
+pub const FD_AUDIO: u64 = 8;
 
 /// Canonical virtual device and `Initramfs` file paths exposed by the FipSOs capability VFS.
 pub const PATH_DRM_CARD0: &str = "/dev/dri/card0";
@@ -18,6 +19,8 @@ pub const PATH_ACCEL_NPU0: &str = "/dev/accel/accel0";
 pub const PATH_FB0: &str = "/dev/fb0";
 pub const PATH_MOUSE0: &str = "/dev/input/mouse0";
 pub const PATH_NET0: &str = "/dev/net/eth0";
+pub const PATH_AUDIO: &str = "/dev/audio";
+pub const PATH_DEV_NULL: &str = "/dev/null";
 pub const PATH_DOWNLOAD_PKG: &str = "/downloads/fipsos_pkg.txt";
 pub const PATH_INDEX_HTML: &str = "/disk/index.html";
 pub const PATH_AI_MODEL_V2: &str = "/disk/ai_model_v2.bin";
@@ -31,11 +34,17 @@ pub const PATH_BIN_C_STD_APP: &str = "/bin/c_std_app.elf";
 pub const PATH_BOOT_LOG: &str = crate::diskfs::PATH_BOOT_LOG;
 pub const PATH_PERSISTENT_NOTE: &str = crate::diskfs::PATH_PERSISTENT_NOTE;
 pub const PATH_SYS_HWMON: &str = "/sys/fipsos/hwmon";
+pub const PATH_BAT0_CAPACITY: &str = "/sys/class/power_supply/BAT0/capacity";
+pub const PATH_BAT0_STATUS: &str = "/sys/class/power_supply/BAT0/status";
+pub const PATH_BAT0_PROFILE: &str = "/sys/class/power_supply/BAT0/profile";
+pub const PATH_BAT0_BOOST: &str = "/sys/class/power_supply/BAT0/boost";
+pub const PATH_WLAN0_OPERSTATE: &str = "/sys/class/net/wlan0/operstate";
 pub const PATH_PROC_MEMINFO: &str = "/proc/meminfo";
 pub const PATH_PROC_CPUINFO: &str = "/proc/cpuinfo";
 pub const PATH_PROC_STAT: &str = "/proc/stat";
 pub const PATH_PROC_MOUNTS: &str = "/proc/mounts";
 pub const PATH_PROC_UPTIME: &str = "/proc/uptime";
+pub const PATH_PROC_VERSION: &str = "/proc/version";
 pub const PATH_PROC_SELF_MOUNTS: &str = "/proc/self/mounts";
 pub const PATH_SYS_CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
 pub const PATH_SYS_CPU_POSSIBLE: &str = "/sys/devices/system/cpu/possible";
@@ -66,11 +75,17 @@ pub const MOUSE_IOCTL_STEP_SYNTHETIC: u64 = 0xC010_4D02;
 pub const NET_IOCTL_PING_GATEWAY: u64 = 0xC010_4E01;
 pub const NET_IOCTL_HTTP_FETCH: u64 = 0xC010_4E02;
 pub const NET_IOCTL_BROWSER_FETCH_SAVE: u64 = 0xC010_4E03;
+pub const WIFI_IOCTL_LOAD_FW: u64 = 0xC010_5701;
+pub const WIFI_IOCTL_WPA2_TEST: u64 = 0xC010_5702;
 pub const VFS_IOCTL_TASK_CONTROL: u64 = 0xC010_5003;
 pub const VFS_IOCTL_LIST_FILES: u64 = 0xC010_5601;
 pub const VFS_IOCTL_LIST_PROCESSES: u64 = 0xC010_5001;
 pub const VFS_IOCTL_HWMON_REPORT: u64 = 0xC010_5002;
 pub const VFS_IOCTL_SYS_TELEMETRY: u64 = 0xC010_5301;
+pub const FIPSOS_IOCTL_LIVE_KERNEL_TELEMETRY: u64 = 0xC010_5304;
+pub const FIPSOS_IOCTL_RAM_RW_PROBE: u64 = 0xC010_5305;
+pub const FIPSOS_IOCTL_MSR_GP_TEST: u64 = 0xC010_5306;
+pub const FIPSOS_IOCTL_CONTAINER_CTL: u64 = 0xC010_5307;
 
 /// Default top-right overlay coordinates and dimensions for `/dev/fb0` Zero-Copy presentation.
 pub const FB_WIDGET_DEFAULT_X: usize = 1096;
@@ -83,7 +98,21 @@ pub const PROT_WRITE: u64 = 0x2;
 
 /// Directory entry information returned by `list_directory` for `sys_getdents64`.
 
+static HWMON_CACHE: ostd::sync::SpinLock<(u64, String)> = ostd::sync::SpinLock::new((0, String::new()));
+
+pub fn invalidate_hwmon_cache() {
+    let mut cache = HWMON_CACHE.lock();
+    cache.1.clear();
+}
+
 pub fn build_hwmon_text() -> String {
+    let now_tick = ostd::arch::x86_64::idt::timer_ticks();
+    {
+        let cache = HWMON_CACHE.lock();
+        if !cache.1.is_empty() && now_tick.saturating_sub(cache.0) < 25 {
+            return cache.1.clone();
+        }
+    }
     let sensors = ostd::arch::x86_64::sensors::snapshot();
     let rtc = ostd::arch::x86_64::rtc_power::read_rtc();
     let topo = ostd::arch::x86_64::topology::detect();
@@ -106,9 +135,14 @@ pub fn build_hwmon_text() -> String {
     let nvme_str = ostd::storage::nvme::summary_text();
     let local_ip = ostd::net::current_ipv4();
     let gw_ip = ostd::net::current_gateway_ipv4();
+    let bat = ostd::arch::x86_64::power_battery::snapshot();
+    #[cfg(target_arch = "x86_64")]
+    let msr_gp = ostd::arch::x86_64::msr::msr_gp_recovered_count();
+    #[cfg(not(target_arch = "x86_64"))]
+    let msr_gp = 0u64;
 
-    alloc::format!(
-        "[HWMON] FipSOs v3.1 Hardware Monitor & Sensores:\n\
+    let text = alloc::format!(
+        "[HWMON] FipSOs v6.3 Hardware Monitor & Sensores:\n\
          CPU: {} (Family {}, Model {}, Stepping {}) @ {} MHz\n\
          Topology: {} nucleos fisicos / {} hilos logicos (SMT)\n\
          Gobernador de Energia ACPI/HLT: ACTIVO | Core 0: {}% uso (idle: {} ticks) | Core 1: {}% uso (idle: {} ticks)\n\
@@ -123,7 +157,9 @@ pub fn build_hwmon_text() -> String {
            - [USB]  Host Controllers (PCIe)    : {}\n\
            - [SIMD] Motor SSE2/AVX Engine C11   : {}\n\
            - [IPC]  Anillos VMO Zero-Syscall    : ACTIVO (/dev/shm/io_ring, /dev/ipc/ring0)\n\
-         Recuperacion de Fallos Anillo 3 (#PF/#GP): {} fallos capturados (Kernel intacto)\n",
+           - [PWR]  Bateria ACPI/EC (BAT0)     : {} ({}, AC: {}, Perfil: {}, Boost: {})\n\
+         Recuperacion de Fallos Anillo 3 (#PF/#GP): {} fallos capturados (Kernel intacto)\n\
+         Proteccion Ring 0 MSR (#GP Safe): {} traps recuperados\n",
         topo.brand(),
         topo.family,
         topo.model,
@@ -161,8 +197,58 @@ pub fn build_hwmon_text() -> String {
         if sensors.fb0_ok { "ACTIVO (Doble Buffer DMA)" } else { "INACTIVO" },
         usb_str,
         if sensors.npu_ok { "ACTIVO (FP32 SSE2 FfiJail)" } else { "INACTIVO" },
-        faults
+        bat.capacity_pct.map_or_else(
+            || alloc::string::String::from("N/A"),
+            |p| alloc::format!("{}%", p),
+        ),
+        bat.status,
+        match bat.ac_online {
+            Some(true) => "ONLINE",
+            Some(false) => "OFFLINE",
+            None => "UNKNOWN",
+        },
+        bat.profile.as_str(),
+        ostd::arch::x86_64::power_battery::boost_str(),
+        faults,
+        msr_gp
+    );
+    let mut cache = HWMON_CACHE.lock();
+    *cache = (now_tick, text.clone());
+    text
+}
+
+/// Builds `/proc/version` kernel release banner.
+pub fn build_version_text() -> String {
+    String::from(
+        "FipSOs version 6.3.0-FipSOs (framekernel@x86_64) (rustc #![forbid(unsafe_code)] + gcc/C++20) #6 SMP\n",
     )
+}
+
+/// Builds `/sys/class/power_supply/BAT0/boost` content.
+pub fn build_bat0_boost_text() -> String {
+    alloc::format!("{}\n", ostd::arch::x86_64::power_battery::boost_str())
+}
+
+/// Builds `/sys/class/net/wlan0/operstate` content from real PCIe Wi-Fi presence.
+pub fn build_wlan0_operstate_text() -> String {
+    String::from(crate::net_80211::wlan0_operstate())
+}
+
+/// Builds `/sys/class/power_supply/BAT0/capacity` content (`None` if no battery).
+pub fn build_bat0_capacity_text() -> Option<String> {
+    ostd::arch::x86_64::power_battery::snapshot()
+        .capacity_pct
+        .map(|pct| alloc::format!("{}\n", pct))
+}
+
+/// Builds `/sys/class/power_supply/BAT0/status` content.
+pub fn build_bat0_status_text() -> String {
+    alloc::format!("{}\n", ostd::arch::x86_64::power_battery::snapshot().status)
+}
+
+/// Builds `/sys/class/power_supply/BAT0/profile` content.
+pub fn build_bat0_profile_text() -> String {
+    alloc::format!("{}\n", ostd::arch::x86_64::power_battery::snapshot().profile.as_str())
 }
 
 /// Builds the real-time memory information text for `/proc/meminfo`.
@@ -186,11 +272,18 @@ pub fn build_meminfo_text() -> String {
 
 /// Builds the mount table text for `/proc/mounts`, `/proc/self/mounts`, and `/etc/mtab`.
 pub fn build_mounts_text() -> String {
+    let fat_line = if crate::fat32::is_mounted() {
+        "/dev/block0 /mnt/fat0 vfat rw 0 0\n"
+    } else {
+        ""
+    };
     alloc::format!(
         "rootfs / rootfs rw 0 0\n\
          /dev/sata0 /disk diskfs rw 0 0\n\
+         {}\
          proc /proc proc rw 0 0\n\
-         devtmpfs /dev devtmpfs rw 0 0\n"
+         devtmpfs /dev devtmpfs rw 0 0\n",
+        fat_line
     )
 }
 
@@ -206,6 +299,8 @@ pub fn build_uptime_text() -> String {
 pub fn build_cpuinfo_text() -> String {
     let topo = ostd::arch::topology::detect();
     let num_cpus = ostd::scheduler::online_cpu_count().max(1);
+    let mhz = ostd::arch::x86_64::sensors::cpu_mhz();
+    let bogomips = mhz.saturating_mul(2);
     let mut out = String::new();
 
     for i in 0..num_cpus {
@@ -216,7 +311,7 @@ pub fn build_cpuinfo_text() -> String {
         let _ = writeln!(out, "model\t\t: {}", topo.model);
         let _ = writeln!(out, "model name\t: {}", topo.brand());
         let _ = writeln!(out, "stepping\t: {}", topo.stepping);
-        let _ = writeln!(out, "cpu MHz\t\t: 2400.000");
+        let _ = writeln!(out, "cpu MHz\t\t: {}.000", mhz);
         let _ = writeln!(out, "cache size\t: 512 KB");
         let _ = writeln!(out, "physical id\t: 0");
         let _ = writeln!(out, "siblings\t: {}", num_cpus);
@@ -230,7 +325,7 @@ pub fn build_cpuinfo_text() -> String {
         let _ = writeln!(out, "wp\t\t: yes");
         let _ = writeln!(out, "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl cpuid pni pclmulqdq ssse3 cx16 pcid sse4_1 sse4_2 x2apic popcnt aes xsave avx hypervisor");
         let _ = writeln!(out, "bugs\t\t:");
-        let _ = writeln!(out, "bogomips\t: 4800.00");
+        let _ = writeln!(out, "bogomips\t: {}.00", bogomips);
         let _ = writeln!(out, "clflush size\t: 64");
         let _ = writeln!(out, "cache_alignment\t: 64");
         let _ = writeln!(out, "address sizes\t: 40 bits physical, 48 bits virtual");

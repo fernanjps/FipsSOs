@@ -356,3 +356,61 @@ pub fn clone_user_vm_space(parent_cr3: PhysAddr) -> Result<PhysAddr, &'static st
     Ok(child_pml4)
 }
 
+/// Counts live present 4 KiB pages mapped in the Lower-Half (user space) of `pml4_phys`.
+pub fn count_user_pages(pml4_phys: PhysAddr) -> usize {
+    if pml4_phys == 0 || pml4_phys == master_kernel_cr3() {
+        return 0;
+    }
+
+    let mut pages = 0usize;
+    // SAFETY: `pml4_phys` is a 4 KiB-aligned PML4 page table reachable via HHDM.
+    let pml4 = unsafe { &*(phys_to_virt(pml4_phys) as *const [u64; 512]) };
+    for &pml4_e in &pml4[0..256] {
+        if (pml4_e & 1) == 0 {
+            continue;
+        }
+        let pdpt_phys = pml4_e & PTE_ADDR_MASK;
+        if pdpt_phys == 0 {
+            continue;
+        }
+        // SAFETY: `pdpt_phys` is a valid present PDPT physical frame reachable via HHDM.
+        let pdpt = unsafe { &*(phys_to_virt(pdpt_phys) as *const [u64; 512]) };
+        for &pdpt_e in pdpt.iter() {
+            if (pdpt_e & 1) == 0 {
+                continue;
+            }
+            if (pdpt_e & (1 << 7)) != 0 {
+                pages += 512 * 512;
+                continue;
+            }
+            let pd_phys = pdpt_e & PTE_ADDR_MASK;
+            if pd_phys == 0 {
+                continue;
+            }
+            // SAFETY: `pd_phys` is a valid present PD physical frame reachable via HHDM.
+            let pd = unsafe { &*(phys_to_virt(pd_phys) as *const [u64; 512]) };
+            for &pd_e in pd.iter() {
+                if (pd_e & 1) == 0 {
+                    continue;
+                }
+                if (pd_e & (1 << 7)) != 0 {
+                    pages += 512;
+                    continue;
+                }
+                let pt_phys = pd_e & PTE_ADDR_MASK;
+                if pt_phys == 0 {
+                    continue;
+                }
+                // SAFETY: `pt_phys` is a valid present PT physical frame reachable via HHDM.
+                let pt = unsafe { &*(phys_to_virt(pt_phys) as *const [u64; 512]) };
+                for &pt_e in pt.iter() {
+                    if (pt_e & 1) != 0 {
+                        pages += 1;
+                    }
+                }
+            }
+        }
+    }
+    pages
+}
+

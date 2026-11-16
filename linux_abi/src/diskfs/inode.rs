@@ -7,7 +7,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub const DISKFS_MAGIC: &[u8; 16] = b"FIPSOS_DISKFS_V2";
-pub const DISKFS_TOTAL_SECTORS: u32 = 32768; // 16 MiB disk = 32,768 sectors of 512 bytes
+pub const DISKFS_TOTAL_SECTORS: u32 = 32768; // 16 MiB DiskFS virtual span (LBA 0..2047 reserved)
+pub const DISKFS_ALLOC_LIMIT_LBA: u32 = 2048; // Hard fence below FAT32 partition at LBA 2048
 pub const DISKFS_INODE_START_LBA: u32 = 1;
 pub const DISKFS_INODE_SECTORS: usize = 32; // 32 sectors * 512 = 16,384 bytes
 pub const DISKFS_MAX_INODES: usize = 128; // 128 inodes * 128 bytes = 16,384 bytes
@@ -183,7 +184,8 @@ pub(crate) fn bitmap_allocate_sectors(bitmap: &mut [u8], count: u32) -> Option<u
     }
     let mut current_start = None;
     let mut consecutive = 0;
-    for lba in DISKFS_DATA_START_LBA..DISKFS_TOTAL_SECTORS {
+    let alloc_cap = DISKFS_ALLOC_LIMIT_LBA.min(DISKFS_TOTAL_SECTORS);
+    for lba in DISKFS_DATA_START_LBA..alloc_cap {
         if !bitmap_is_allocated(bitmap, lba) {
             if current_start.is_none() {
                 current_start = Some(lba);

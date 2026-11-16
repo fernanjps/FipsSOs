@@ -143,6 +143,7 @@ fn poll_one_remote_console_packet() -> bool {
 
     if dst_port != REMOTE_CONSOLE_PORT {
         feed_client_socket(frame);
+        super::tcp_server::enqueue_rx_frame(frame);
         return true;
     }
 
@@ -244,7 +245,7 @@ fn poll_one_remote_console_packet() -> bool {
         // Check if welcome banner has not been transmitted yet (sent on 3-way ACK or first payload)
         if !state.welcome_sent && ((flags & TCP_FLAG_ACK) != 0 || payload_len > 0) {
             state.welcome_sent = true;
-            let welcome = b"\r\n=== Conectado a FipSOs v3.4 Remote Shell (TCP :2222) ===\r\nfipsos:/# ";
+            let welcome = b"\r\n=== Conectado a FipSOs v6.3 Remote Shell (TCP :2222) ===\r\nfipsos:/# ";
             let mut banner_frame = alloc::vec![0u8; 14 + 20 + 20 + welcome.len()];
             let flen = build_tcp_frame(
                 my_mac,
